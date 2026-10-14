@@ -1,0 +1,71 @@
+name: upstream-sync
+
+# Prepares and keeps refreshed the rolling upstream-synchronization pull request
+# (branch `sync/upstream`).
+#
+# This is a Git/filesystem synchronization, not engine CI.  It fetches upstream
+# git objects and applies .fork/path-policy -- it never builds, tests, installs or
+# otherwise runs anything that came from upstream.  See .fork/README.md.
+#
+# Repository setting required once: Settings -> Actions -> General ->
+# "Allow GitHub Actions to create and approve pull requests".
+
+on:
+  schedule:
+    # Every third day, off the top of the hour.
+    - cron: '17 3 */3 * *'
+  workflow_dispatch:
+
+# Minimal: push the rolling branch, and open/update its pull request.
+permissions:
+  contents: write
+  pull-requests: write
+
+# One synchronization at a time; a second run waits rather than racing on the
+# rolling branch.
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # The synchronization implementation must come from the trusted default
+      # branch.  Depth 1 is enough: the merge base comes from upstream's history,
+      # not ours.  Submodules are never checked out.
+      - name: Check out the default branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Check the synchronization setup
+        run: |
+          set -o pipefail
+          .fork/scripts/validate-sync.sh 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Prepare the synchronization candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORK_SYNC_AUTHOR_NAME: github-actions[bot]
+          FORK_SYNC_AUTHOR_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+          FORK_SYNC_REPORT: ${{ runner.temp }}/sync-report.md
+        run: |
+          .fork/scripts/sync-upstream.sh \
+            --push --pr \
+            --pr-base "${{ github.event.repository.default_branch }}" \
+            --report "$FORK_SYNC_REPORT"
+
+      # Always publish the report: it explains the outcome, and why nothing was
+      # published when a change needed a human decision.
+      - name: Summarise
+        if: always()
+        run: |
+          if [ -f "$FORK_SYNC_REPORT" ]; then
+            cat "$FORK_SYNC_REPORT" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No synchronization report was produced; see the step log above." >> "$GITHUB_STEP_SUMMARY"
+          fi

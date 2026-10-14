@@ -87,34 +87,90 @@ The fork exists to run Strata's inference engine on the maintainer's PC: one 16 
   adaptation on top of their text. The submodule itself is deliberately not patched (unlike
   UnbiasedStrata, whose one patch exists because its frontend needs a fix inside llama.cpp's chat
   parser, code we do not use yet).
+- **Upstream synchronization infrastructure** (`.fork/`, `.github/workflows/sync-upstream.yml`): a
+  scheduled workflow prepares a rolling `sync/upstream` pull request. The accepted upstream
+  revision lives in `.fork/upstream.lock` and is passed to git as the *merge base* of the content
+  merge (`git merge-tree --write-tree --merge-base=<lock>`), so the fork's own deletions cannot be
+  silently undone and a **squash merge** of the sync pull request still advances the baseline
+  correctly (git's own merge base goes stale after a squash; the lock file does not). Path rules
+  live in `.fork/path-policy` (`mirror`/`dropped`/`ours`/`protected`, plus the built-in `pruned`
+  rule for everything the fork deleted). The candidate also records the upstream tip as its second
+  parent, so merging with a **merge commit** keeps `git merge-base main upstream/main` — and
+  GitHub's "N commits behind" — accurate. That second parent is an assertion that the whole
+  range was accounted for, so it is only ever attached after every changed path was classified
+  and resolved: any protected/unclassified path or mirrored conflict stops the run before a
+  commit object exists. Candidates are self-describing (`Fork-Sync-Base:`/`Fork-Sync-Upstream:`
+  trailers checked against the actual parents, plus the lock inside the candidate matching its
+  second parent), which is also how the rolling branch is proved to be automation-owned before
+  it is replaced. Nothing from upstream is ever executed while synchronizing. See
+  `.fork/README.md`.
 - `.gitignore`/`.gitattributes`/`README.md`/`AGENTS.md` trimmed to the retained tree.
 - Deliberately NOT copied from UnbiasedStrata: its C++ `frontend/`, its engine-source patches
   (`robust_read.hpp`, `expert_source.cpp`, `ngram.cpp` changes), its llama.cpp submodule/patch
   machinery, its older-CPU path removals. Those are its own reworkings against engine 0.1.39.
 
+## Active source divergences
+
+Path-indexed on purpose: the synchronization report flags any of these paths when upstream touches
+them, and this is where the reason for that flag lives. Whenever a new patch is carried on a
+mirrored file, add an entry here. (Derivable facts live in the tree; "why" only exists here.)
+
+### D001 — vendored llama.cpp (the fork's own dependency integration)
+
+- Paths: `CMakeLists.txt` (upstream's `FetchContent` block replaced by the submodule),
+  `tools/_paths.py` (one comment: `gguf-py` comes from the vendored submodule, not `setup.py`).
+  Additionally `.gitmodules` and the `third_party/llama.cpp` gitlink, both `protected` by the
+  path policy rather than mirrored.
+- Introduced: `f4343dd9` (vendoring).
+- Why: this fork pins llama.cpp itself (`b11624` = `af0579c`, newer than upstream's `3cf0325`) and
+  builds ggml from that checkout instead of letting the build fetch a tag.
+- Expected when upstream touches it: `CMakeLists.txt` changes surface as a merge conflict and stop
+  the run, because the fork's edits occupy the same region as upstream's dependency pin. That is
+  the intended failure mode — do not "fix" it by classifying the file `ours`, which would discard
+  upstream's other build changes.
+- Retire when: only if upstream adopts a pinned dependency the fork can follow instead.
+
+### D002 — MMQ call-site adaptation for the vendored llama.cpp
+
+- Paths: `src/prefill/moe_mmq.cu`, `src/prefill/mmq_kq_lib.cu`, `src/prefill/mmq_nvfp4_w4a8.cu`,
+  `src/prefill/mmq_nvfp4_w4a4.cu`.
+- Introduced: `02ed2cda`.
+- Why: llama.cpp `b11624` changed `mul_mat_q_case` (second template parameter = the activations'
+  precision), `mmq_args` (`ncols_opt` became the required `J_best` tile width) and
+  `ggml_cuda_mmq_get_config` (takes the precision), while upstream Strata still compiles against
+  the old `3cf0325` API. These four files are the fork's porting cost of the newer pin; the
+  submodule itself stays unpatched. See "Divergences from upstream" for the recipe.
+- Expected when upstream touches it: a clean textual merge *only* if the edits are on different
+  lines, so the flag means "read the merged file" rather than "it broke".
+- Retire when: upstream Strata moves to the same or a newer llama.cpp API, which makes these four
+  files pristine mirrors again.
+
 ## Deferred
 
-- **llama.cpp vendoring**: replace the CMake `FetchContent` of the pinned llama.cpp commit with a
-  vendored `third_party/llama.cpp` submodule (and bring the serving/tokenizer side from it, as
-  UnbiasedStrata does). Dedicated later phase; until then the build still fetches the pinned commit.
-  Target pin chosen by the maintainer: `a0e6dc7384edb8f5d927155e1d26c10b4a310e6d`
-  (ggml-org/llama.cpp, 2026-10). Current pin in this tree: `3cf03257f219afbe7334045ff7c6a06ac68c627d`
-  (`third_party/ggml/VERSION.txt` and the `GIT_TAG` in `CMakeLists.txt`; both must move together).
-  Note: the new pin changes ggml behaviour the engine's parity tests compare against — after
-  vendoring, run the CUDA/CPU parity tests and re-check the i-quant/Q2_0 contracts before trusting
-  results.
+- **Serving/tokenizer side of llama.cpp**: the vendored submodule supplies ggml, the MMQ kernel
+  sources and `ggml-common.h` only. Borrowing more from it (tokenizer/chat parsing for a future
+  frontend, as UnbiasedStrata does) is a later phase; the submodule stays pristine until then.
 - **Serving/API**: no HTTP/OpenAI endpoint exists until the llama.cpp-based frontend lands. Until
   then the engine is driven via its CLI/token-ids interface.
-- **GitHub Actions / CI**: intentionally not set up yet.
-- **Porting upstream changes**: the plan is to keep following upstream Strata; the vendored
-  submodule may need re-pinning when an upstream port requires a newer/older llama.cpp.
+- **GitHub Actions / CI**: only the upstream-synchronization workflow exists
+  (`.github/workflows/sync-upstream.yml`; roughly every third day, plus manual dispatch). Engine
+  build/test CI is still absent on purpose — a synchronization candidate must be built and tested
+  by hand before its pull request is merged. The workflow needs the repository setting
+  *Settings -> Actions -> General -> "Allow GitHub Actions to create and approve pull requests"*.
+- **Porting upstream changes**: keep following upstream through the tooling in `.fork/` (see
+  "Divergences from upstream" and `.fork/README.md`). Do **not** `git merge upstream/main` by hand:
+  the content merge needs `.fork/upstream.lock` as its base and the path policy applied on top.
+  Engine sources stay untouched, so `git diff upstream/main -- src include` remains meaningful, and
+  deleted add-on trees show as ours-only removals. The vendored submodule may need re-pinning when
+  an upstream port requires a newer or older llama.cpp.
 - **Multi-GPU and the vision encoder** (`tools/vision`, engine mmproj path) are planned features,
   not leftovers. Windows: the maintainer works from WSL2 but wants native Windows builds to keep
   working (MSVC paths, `include/strata/windows/`, `tools/windows/` are retained for that) because
   serving from WSL has latency problems — treat the Windows build as supported,
   verification-pending.
 - **Upstream sync**: engine sources are untouched, so `git diff upstream/main -- src include` stays
-  meaningful; deleted add-on trees will show as ours-only removals.
+  meaningful; deleted add-on trees will show as ours-only removals. Local patches to mirrored
+  files are listed under "Active source divergences" above.
 
 ## Uncertainties
 
@@ -131,3 +187,17 @@ The fork exists to run Strata's inference engine on the maintainer's PC: one 16 
   them anymore until the frontend phase.
 - HIP/AMD, Windows, older-CPU (ISA floor) and gfx906 paths are retained for upstream parity and
   untested here.
+- The upstream-synchronization machinery is exercised by `.fork/tests/run.sh` (153 checks over
+  miniature repositories: no-op, clean ranges, dropped/protected/ours/unclassified paths, rewritten
+  history, merge conflicts, squash vs merge commit, rolling-branch ownership, a patched mirrored
+  file merging cleanly, and non-leaking working directories) plus `.fork/scripts/validate-sync.sh`
+  (59 checks against this repository). A real dry run reports "up to date" because upstream `main`
+  currently equals this fork's baseline `296b59d2`. A 300-commit window of real upstream history
+  was classified to audit the path policy: 1804 paths, 1542 dropped / 254 mirror / 8 ours, none
+  unclassified. The fork's own divergences on mirrored paths are `CMakeLists.txt`, the four MMQ
+  call sites (D001/D002 above) and `tools/_paths.py`.
+- **Not yet exercised**: the GitHub workflow itself (no run yet — the first scheduled or manual
+  dispatch is the first real test of `actions/checkout` + push + `gh pr create`), and a real
+  synchronization of a non-empty upstream range with the real remote. A *stale* lock was simulated
+  against real history to confirm it fails closed (it conflicts on `CMakeLists.txt`, where the
+  fork's vendoring edits meet upstream's own ggml integration pin).

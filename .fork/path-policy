@@ -1,0 +1,65 @@
+# .fork/path-policy -- how an upstream change to a path is handled.
+#
+#   mirror     take upstream's version (new files, edits, deletions)
+#   dropped    the path stays absent: the fork removed it on purpose
+#   ours       the fork owns the file: keep ours, report upstream's change
+#   protected  upstream must never touch this: a change here stops the sync
+#
+# Rules are matched in order, first match wins, so exceptions go above the rule
+# they except.  The `pruned` line is the built-in rule for the fork's own
+# deletions: a path that exists in the accepted upstream revision but not in the
+# fork was removed on purpose and stays removed.  Its position matters -- it
+# keeps pruned files dropped even when a later `mirror` rule covers their
+# directory.
+#
+# A path that matches nothing is `unknown` and stops the sync: a new upstream
+# surface (a new top-level directory, a new installer, ...) is a fork decision,
+# not something to absorb silently.
+
+# --- fork control surface -------------------------------------------------
+# Upstream has none of this, so a change here means something is wrong.
+protected .fork/**
+protected .gitmodules
+protected third_party/llama.cpp
+
+# --- fork-owned files -----------------------------------------------------
+# Upstream edits these heavily (marketing README, installer docs); we keep ours
+# and report what changed.
+ours .github/**
+ours README.md
+ours AGENTS.md
+ours FORK_NOTES.md
+ours .gitignore
+ours .gitattributes
+ours LICENSE
+
+# --- what we deleted ------------------------------------------------------
+pruned
+
+# --- kept data, then everything else under those directories (dropped) ----
+mirror data/draft_vocab.bin
+mirror data/draft_vocab_en.bin
+mirror data/expert-profile.bin
+mirror data/expert-profile-coder.bin
+dropped data/**
+
+# --- kept benchmarks, then the rest of bench (almost all of it dropped) ---
+mirror bench/micro/**
+mirror bench/gfx906_qsa_query_swizzle_probe.cpp
+mirror bench/test_gfx906_qsa_query_swizzle_guard.py
+dropped bench/**
+
+# --- removed platform ports and documentation ----------------------------
+dropped docs/**
+dropped metal/**
+dropped serve/**
+dropped sycl/**
+
+# --- the engine: followed from upstream ----------------------------------
+mirror CMakeLists.txt
+mirror cmake/**
+mirror include/**
+mirror ref/**
+mirror src/**
+mirror tests/**
+mirror tools/**

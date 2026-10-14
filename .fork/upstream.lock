@@ -1,0 +1,15 @@
+# Fork metadata: the upstream Strata revision this fork's default branch already
+# contains, plus where that revision comes from.
+#
+# The `commit` line is the source of truth for ".fork/scripts/sync-upstream.sh":
+# a synchronization applies exactly `commit..<latest upstream>` and rewrites this
+# line to the revision it just integrated.  Merging the synchronization pull
+# request therefore advances the accepted baseline.
+#
+# Do not hand-edit: .fork/scripts/validate-sync.sh checks this file's shape, and
+# the synchronization stops if the recorded commit is no longer an ancestor of
+# upstream's history (that means upstream rewrote history and a human must decide).
+
+repository = https://github.com/Niko1221/Strata.git
+branch     = main
+commit     = 296b59d2f73c8f04a805df29c2fa97655adace78
