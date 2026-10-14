@@ -1,6 +1,6 @@
 """tools/_paths.py - where the tools find llama.cpp's gguf-py (for the MTP packer and the fixtures).
 
-Order: $STRATA_GGUF_PY, then <engine>/third_party/llama.cpp/gguf-py (what setup.py clones), then the development
+Order: $STRATA_GGUF_PY, then <engine>/third_party/llama.cpp/gguf-py (the vendored submodule), then the development
 tree's ../../.ref/llama.cpp/gguf-py.
 """
 from __future__ import annotations

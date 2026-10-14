@@ -10,6 +10,14 @@
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.44.1 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+
+# llama.cpp is vendored as a submodule (third_party/llama.cpp; see FORK_NOTES.md): ggml, the MMQ kernel
+# sources and ggml-common.h all come from that one pinned commit, and the build fetches nothing.
+set(STRATA_GGML_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/llama.cpp" CACHE PATH
+    "llama.cpp checkout to take ggml, the MMQ sources and ggml-common.h from")
+if(NOT EXISTS "${STRATA_GGML_DIR}/ggml/CMakeLists.txt")
+  message(FATAL_ERROR "llama.cpp was not found at ${STRATA_GGML_DIR}: run `git submodule update --init` first")
+endif()
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -417,8 +425,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME qsa_select_bench_fp32_tiled COMMAND qsa_select_bench 131072 256 3 262144)
     set_tests_properties(qsa_select_bench_fp32_tiled PROPERTIES ENVIRONMENT "STRATA_QSA_WARP=1;STRATA_SELECT_SIMT=1")
   endif()
-  # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/ggml)
-  target_include_directories(strata_kernels PRIVATE third_party/ggml)
+  # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT; ggml-common.h
+  # comes from the vendored llama.cpp submodule's ggml/src, the same commit the library is built from)
+  target_include_directories(strata_kernels PRIVATE ${STRATA_GGML_DIR}/ggml/src)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
   if(STRATA_ENABLE_CUDA)
     set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
@@ -1247,9 +1256,8 @@ target_link_libraries(strata_kernels_cpu PUBLIC Threads::Threads)
 # ---- plan v0.3 P6: the i-quant models' CPU experts (IQ2_XS / IQ3_XXS files) ----
 #
 # The CPU computes a native expert with ggml-cpu's own dot products (`ggml_get_type_traits_cpu`), so an IQ
-# weight means exactly what it means in llama.cpp.  ggml is built static from a llama.cpp checkout: a local one
-# with -DSTRATA_GGML_DIR=..., otherwise the pinned upstream commit (third_party/ggml/VERSION.txt).
-set(STRATA_GGML_DIR "" CACHE PATH "llama.cpp checkout to take ggml from (empty: fetch the pinned commit)")
+# weight means exactly what it means in llama.cpp.  ggml is built static from the vendored llama.cpp
+# submodule (STRATA_GGML_DIR, pinned above).
 if(STRATA_PREFILL_MMQ AND NOT STRATA_NATIVE_EXPERTS)
   message(FATAL_ERROR "STRATA_PREFILL_MMQ requires STRATA_NATIVE_EXPERTS=ON for GGML sources")
 endif()
@@ -1289,27 +1297,14 @@ if(STRATA_NATIVE_EXPERTS)
   else()
     set(GGML_NATIVE ON CACHE BOOL "" FORCE)
   endif()
-  if(STRATA_GGML_DIR)
-    add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
-  else()
-    include(FetchContent)
-    FetchContent_Declare(strata_llamacpp
-      GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-      GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
-      GIT_SHALLOW FALSE)
-    FetchContent_GetProperties(strata_llamacpp)
-    if(NOT strata_llamacpp_POPULATED)
-      FetchContent_Populate(strata_llamacpp)
-    endif()
-    add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
-  endif()
+  add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
   target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
                                            src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
                                            src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
                                            src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp)
-  target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
+  target_include_directories(strata_kernels_cpu PRIVATE ${STRATA_GGML_DIR}/ggml/src)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
                                 PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
@@ -1400,11 +1395,7 @@ if(STRATA_NATIVE_EXPERTS)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
     # from the same checkout as ggml above - only mmq.cuh's instances for the packs' types and the quantizer, with
     # the few host symbols of ggml-cuda.cu they use in src/prefill/ggml_cuda_host.cu
-    if(STRATA_GGML_DIR)
-      set(_strata_gg ${STRATA_GGML_DIR}/ggml)
-    else()
-      set(_strata_gg ${strata_llamacpp_SOURCE_DIR}/ggml)
-    endif()
+    set(_strata_gg ${STRATA_GGML_DIR}/ggml)
     set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
     # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; CUDA
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
@@ -1524,11 +1515,7 @@ if(STRATA_NATIVE_EXPERTS)
   elseif(STRATA_PREFILL_MMQ)
     # Compile only the pinned GGML MMQ and activation-quantizer sources used by prefill. This uses
     # common.cuh's native HIP path without enabling a second GGML HIP backend.
-    if(STRATA_GGML_DIR)
-      set(_strata_gg "${STRATA_GGML_DIR}/ggml")
-    else()
-      set(_strata_gg "${strata_llamacpp_SOURCE_DIR}/ggml")
-    endif()
+    set(_strata_gg "${STRATA_GGML_DIR}/ggml")
     set(_strata_mmq "${_strata_gg}/src/ggml-cuda")
     if(NOT EXISTS "${_strata_mmq}/common.cuh" OR NOT EXISTS "${_strata_mmq}/quantize.cu")
       message(FATAL_ERROR "The selected GGML source is missing the ggml-cuda MMQ sources: ${_strata_mmq}")

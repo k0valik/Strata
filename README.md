@@ -10,15 +10,19 @@ for exactly what was removed, what is kept, and what is deferred.
 
 ## Build
 
-Requires CMake 3.24+, a C++20 compiler, and a CUDA toolkit (or AMD HIP, or CPU-only). ggml is taken
-from llama.cpp at the pinned commit in `third_party/ggml/VERSION.txt` (fetched by CMake; a vendored
-submodule replaces this in a later phase):
+Requires CMake 3.24+, a C++20 compiler, and a CUDA toolkit (or AMD HIP, or CPU-only). First check out
+the vendored llama.cpp submodule (pinned at tag `b11624`, commit `af0579c`) — the build fetches
+nothing on its own:
 
 ```
+git submodule update --init
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=ON
 cmake --build build -j
 ctest --test-dir build
 ```
+
+ggml, the MMQ kernel sources and `ggml-common.h` all come from the pinned submodule
+(`STRATA_GGML_DIR`, `-DSTRATA_GGML_DIR=...` overrides it).
 
 ## Layout
 

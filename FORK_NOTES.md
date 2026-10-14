@@ -21,8 +21,12 @@ The fork exists to run Strata's inference engine on the maintainer's PC: one 16 
   `ref/`, `tests/`, engine parity/bench sources in `bench/micro/` and `bench/gfx906_*`.
 - Engine build backends kept as-is (same sources, backend chosen at configure time): CUDA, HIP,
   CPU (AVX2/AVX-512/AVX1 floors). Windows source paths kept (in-source, inseparable without a rewrite).
-- ggml/llama.cpp dependency: still fetched by CMake `FetchContent` at the pinned commit
-  (`third_party/ggml/VERSION.txt`) — to be replaced by a vendored submodule in a later phase.
+- ggml/llama.cpp dependency: **vendored as a git submodule** `third_party/llama.cpp`, pinned at
+  tag `b11624` = commit `af0579c78a07a555d84830d01da7b61cfadbc7ef` (ggml-org/llama.cpp, 2026-10;
+  chosen by the maintainer, newer than upstream Strata's pin). CMake takes ggml, the MMQ kernel
+  sources and `ggml-common.h` from it (`STRATA_GGML_DIR`, overridable with `-DSTRATA_GGML_DIR`);
+  the build fetches nothing and fails with a `git submodule update --init` hint when the submodule
+  is not checked out. `.gitmodules` is marked `shallow = true`.
 - Model preparation tools (`tools/`): the pack/draft/profile pipeline (`iq_pack`, `mtp_*`,
   `make_profile`, `pack_*`, `strata_pack`, `strata_tokenizer`, `draft_vocab`, `gguf_*`,
   `embd_bf16_pack`, `ple_fp8_pack`, `nvfp4_*`, `quant_formats`) and their unit tests.
@@ -65,8 +69,14 @@ The fork exists to run Strata's inference engine on the maintainer's PC: one 16 
 
 ## Divergences from upstream
 
-- Deletions above; `CMakeLists.txt` lost only the SYCL option block; no engine source
-  (`src/`, `include/`) was modified.
+- Deletions listed above; no engine source (`src/`, `include/`) was modified.
+- **llama.cpp vendoring** (vs upstream's build-time `FetchContent` of `3cf0325...`): submodule
+  `third_party/llama.cpp` pinned at `af0579c78a07a555d84830d01da7b61cfadbc7ef` (tag `b11624`).
+  The `third_party/ggml/` header snapshot (LICENSE, VERSION.txt, a verbatim copy of
+  `ggml-common.h` from `3cf0325`) was deleted; the engine now includes `ggml-common.h` from the
+  submodule's `ggml/src`, so header and library always come from the same commit. Upstream's
+  provenance comments inside `src/`/`include/` still cite `3cf03257`/`third_party/ggml` and were
+  deliberately left untouched to keep engine-source diffs against upstream clean.
 - `.gitignore`/`.gitattributes`/`README.md`/`AGENTS.md` trimmed to the retained tree.
 - Deliberately NOT copied from UnbiasedStrata: its C++ `frontend/`, its engine-source patches
   (`robust_read.hpp`, `expert_source.cpp`, `ngram.cpp` changes), its llama.cpp submodule/patch
@@ -83,23 +93,32 @@ The fork exists to run Strata's inference engine on the maintainer's PC: one 16 
   Note: the new pin changes ggml behaviour the engine's parity tests compare against — after
   vendoring, run the CUDA/CPU parity tests and re-check the i-quant/Q2_0 contracts before trusting
   results.
-- **Serving/API**: no HTTP/OpenAI endpoint exists after this phase until the llama.cpp-based
-  frontend lands. Until then the engine is driven via its CLI/token-ids interface.
-- **GitHub Actions / CI**: intentionally not set up in this phase.
-- **HIP/AMD, Windows, multi-GPU, older-CPU (ISA floor), gfx906**: retained in source/build options
-  for upstream parity. Multi-GPU and the vision encoder (`tools/vision`, engine mmproj path) are
-  planned features, not leftovers. Windows: the maintainer works from WSL2 but wants native Windows
-  builds to keep working (MSVC paths, `include/strata/windows/`, `tools/windows/` are retained for
-  that) because serving from WSL has latency problems — treat the Windows build as supported,
+- **Serving/API**: no HTTP/OpenAI endpoint exists until the llama.cpp-based frontend lands. Until
+  then the engine is driven via its CLI/token-ids interface.
+- **GitHub Actions / CI**: intentionally not set up yet.
+- **Porting upstream changes**: the plan is to keep following upstream Strata; the vendored
+  submodule may need re-pinning when an upstream port requires a newer/older llama.cpp.
+- **Multi-GPU and the vision encoder** (`tools/vision`, engine mmproj path) are planned features,
+  not leftovers. Windows: the maintainer works from WSL2 but wants native Windows builds to keep
+  working (MSVC paths, `include/strata/windows/`, `tools/windows/` are retained for that) because
+  serving from WSL has latency problems — treat the Windows build as supported,
   verification-pending.
 - **Upstream sync**: engine sources are untouched, so `git diff upstream/main -- src include` stays
   meaningful; deleted add-on trees will show as ours-only removals.
 
 ## Uncertainties
 
+- The engine is compiled against a llama.cpp commit **newer than upstream Strata pins**. Upstream's
+  parity tests compare engine output against ggml behaviour, so results can legitimately shift with
+  the newer ggml; if a block layout or MMQ template changed between `3cf0325` and `af0579c`, the
+  build or the parity tests will show it. Verification still to run (see README):
+  `git submodule update --init`, configure, build, `ctest`. The submodule checkout itself has not
+  been done during this session (no downloads by policy); the gitlink pin is recorded, not cloned.
 - Whether `tools/nvfp4_verify*.py` (import `torch`) are wanted long-term; kept as model-prep
   verification tooling for the retained NVFP4 engine path.
 - `tools/windows/enable_large_pages.ps1` kept as a tiny runtime helper for the retained Windows
   engine paths.
 - Engine `--serve` mode and vision encoder are kept in source although nothing in-tree launches
   them anymore until the frontend phase.
+- HIP/AMD, Windows, older-CPU (ISA floor) and gfx906 paths are retained for upstream parity and
+  untested here.
