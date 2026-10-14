@@ -71,12 +71,22 @@ The fork exists to run Strata's inference engine on the maintainer's PC: one 16 
 
 - Deletions listed above; no engine source (`src/`, `include/`) was modified.
 - **llama.cpp vendoring** (vs upstream's build-time `FetchContent` of `3cf0325...`): submodule
-  `third_party/llama.cpp` pinned at `af0579c78a07a555d84830d01da7b61cfadbc7ef` (tag `b11624`).
-  The `third_party/ggml/` header snapshot (LICENSE, VERSION.txt, a verbatim copy of
-  `ggml-common.h` from `3cf0325`) was deleted; the engine now includes `ggml-common.h` from the
-  submodule's `ggml/src`, so header and library always come from the same commit. Upstream's
-  provenance comments inside `src/`/`include/` still cite `3cf03257`/`third_party/ggml` and were
-  deliberately left untouched to keep engine-source diffs against upstream clean.
+  `third_party/llama.cpp` pinned at `af0579c78a07a555d84830d01da7b61cfadbc7ef` (tag `b11624`),
+  checked out locally; the submodule is pristine (no patches applied to it). The old
+  `third_party/ggml/` header snapshot (a verbatim `ggml-common.h` from `3cf0325`) was deleted; the
+  engine includes `ggml-common.h` from the submodule's `ggml/src`, so header and library always
+  come from the same commit. Diffed old-vs-new pin: `ggml-common.h`, `ggml.h`, `ggml-cpu.h`, the
+  context/pool structs and `quantize_mmq_q8_1_cuda` are unchanged; the only API break was in
+  `mmq.cuh` (see next point).
+- **MMQ call-site adaptation** (`src/prefill/moe_mmq.cu`, `mmq_kq_lib.cu`, `mmq_nvfp4_w4a8.cu`,
+  `mmq_nvfp4_w4a4.cu`): `mul_mat_q_case` takes a second template parameter (the activations'
+  precision; Q8 everywhere, Q4 only for the W4A4 NVFP4 unit), `mmq_args`' `ncols_opt` became a
+  required `J_best` tile width (chosen by the same config probe llama.cpp's own launcher makes),
+  and `ggml_cuda_mmq_get_config` takes the precision. Upstream Strata still compiles against the
+  OLD (3cf0325) MMQ API — when porting future upstream changes to these four files, re-apply this
+  adaptation on top of their text. The submodule itself is deliberately not patched (unlike
+  UnbiasedStrata, whose one patch exists because its frontend needs a fix inside llama.cpp's chat
+  parser, code we do not use yet).
 - `.gitignore`/`.gitattributes`/`README.md`/`AGENTS.md` trimmed to the retained tree.
 - Deliberately NOT copied from UnbiasedStrata: its C++ `frontend/`, its engine-source patches
   (`robust_read.hpp`, `expert_source.cpp`, `ngram.cpp` changes), its llama.cpp submodule/patch
@@ -108,12 +118,11 @@ The fork exists to run Strata's inference engine on the maintainer's PC: one 16 
 
 ## Uncertainties
 
-- The engine is compiled against a llama.cpp commit **newer than upstream Strata pins**. Upstream's
-  parity tests compare engine output against ggml behaviour, so results can legitimately shift with
-  the newer ggml; if a block layout or MMQ template changed between `3cf0325` and `af0579c`, the
-  build or the parity tests will show it. Verification still to run (see README):
-  `git submodule update --init`, configure, build, `ctest`. The submodule checkout itself has not
-  been done during this session (no downloads by policy); the gitlink pin is recorded, not cloned.
+- The engine is compiled against a llama.cpp commit **newer than upstream Strata pins**, with the
+  MMQ call-site adaptation above carried in-tree. Verification still to run: configure + build
+  `STRATA_ENABLE_CUDA` with the submodule checked out, then `ctest` (in particular
+  `prefill_fused_moe_test`, `prefill_fused_iq_test`, `prefill_mmq_kquant_test`,
+  `mmq_nvfp4_parity`, the CPU parity tests, and the HIP MMQ parity tests on AMD hardware).
 - Whether `tools/nvfp4_verify*.py` (import `torch`) are wanted long-term; kept as model-prep
   verification tooling for the retained NVFP4 engine path.
 - `tools/windows/enable_large_pages.ps1` kept as a tiny runtime helper for the retained Windows

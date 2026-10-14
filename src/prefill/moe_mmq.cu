@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <climits>
 
 namespace strata::prefill::mmq {
 #if defined(STRATA_KQ_DSO)
@@ -223,16 +224,19 @@ bool supported(int t) {
 
 bool fits(int t, int64_t w_rows) {
     if (!supported(t)) return false;
-    // mul_mat_q_case's choice: the "fallback" configs when the rows are not a multiple of 128; then
-    // mul_mat_q_switch_J's loop - a tile size whose config exists for this card and fits its shared memory
-    const bool fallback = w_rows % 128 != 0;
+    // llama.cpp's MMQ runs the "fallback" configs when the rows are not a multiple of 128, and the caller picks a
+    // tile width J whose config exists for this card and fits its shared memory (the same choice its own launcher
+    // makes; see choose_j_best in run below).  The activations' precision selects the config set: Q8 everywhere,
+    // except the W4A4 NVFP4 unit's FP4 activations on Blackwell.
+    const ggml_prec prec = fp4_activations(t) ? GGML_PREC_Q4 : GGML_PREC_Q8;
+    const bool fallback = ggml_cuda_mmq_needs_fallback(w_rows);
     const ggml_cuda_device_info& info = ggml_cuda_info();
     for (int id = 0; id < info.device_count; ++id) {
         const int cc = info.devices[id].cc;
         const size_t smpbo = info.devices[id].smpbo;
         bool any = false;
         for (int J = 8; J <= 128 && !any; J += 8) {
-            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc);
+            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config((ggml_type) t, J, fallback, cc, prec);
             any = c.type != GGML_TYPE_COUNT && mmq_get_nbytes_shared(c, cc) <= smpbo;
         }
         if (!any) {
@@ -335,26 +339,51 @@ void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
     const int64_t qk = ggml_blck_size(t), bpr = p.w_cols / qk;
+    auto& ctx = *(ggml_backend_cuda_context*) ctx_;
+    const cudaStream_t s = (cudaStream_t) stream;
+    // The tile width J (in the expert direction) llama.cpp's MMQ kernels switch on: the smallest number of
+    // weight-row tiles over the widths whose config exists for the context's card and fits its shared memory -
+    // the same probe llama.cpp's own launcher makes (mmq.cu's J_best; the row count as the value to optimize
+    // against, as this file's callers always did).  fits() has already checked that some J works; switch_J
+    // aborts the process on a width without a config, so a miss here must not launch.
+    int j_best = 0;
+    const ggml_prec prec = fp4_activations(t) ? GGML_PREC_Q4 : GGML_PREC_Q8;
+    {
+        const ggml_cuda_device_info& info = ggml_cuda_info();
+        const int cc = info.devices[ctx.device].cc;
+        const size_t smpbo = info.devices[ctx.device].smpbo;
+        const bool fallback = ggml_cuda_mmq_needs_fallback(p.w_rows);
+        for (int J = 8, best = INT_MAX; J <= 128 && best > 1; J += 8) {
+            const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config(t, J, fallback, cc, prec);
+            if (c.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(c, cc) > smpbo) continue;
+            const int ntiles = (int) ((p.max_rows + c.J - 1) / c.J);
+            if (ntiles < best) { j_best = J; best = ntiles; }
+        }
+    }
+    if (j_best == 0) {
+        std::fprintf(stderr, "prefill mmq: no MMQ tile for %s fits GPU %d's shared memory at precision %d; "
+                             "the product must take the non-MMQ path (#420)\n",
+                     ggml_type_name(t), ctx.device, (int) prec);
+        std::exit(1);
+    }
     const mmq_args a = {(const char*) p.w, t, (const int*) p.xq, p.ids, p.bounds, p.dst, p.y_scale,
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, p.max_rows};
-    auto& ctx = *(ggml_backend_cuda_context*) ctx_;
-    const cudaStream_t s = (cudaStream_t) stream;
+                        p.max_rows, j_best};
     switch (t) {
 #ifdef STRATA_ORCA_Q4KS_MMQ
-        case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;
+        case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0, GGML_PREC_Q8>(ctx, a, s); break;
 #endif
-        case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
-        case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
-        case GGML_TYPE_IQ3_XXS: mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, a, s); break;
-        case GGML_TYPE_IQ3_S: mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, a, s); break;
-        case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
-        case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
-        case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+        case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_IQ3_XXS: mul_mat_q_case<GGML_TYPE_IQ3_XXS, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_IQ3_S: mul_mat_q_case<GGML_TYPE_IQ3_S, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0, GGML_PREC_Q8>(ctx, a, s); break;
 #if defined(STRATA_MMQ_KQUANTS) && defined(STRATA_KQ_DSO)
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q5_1: {
             const int e = kq::run((int) t, &a, s);
@@ -365,10 +394,10 @@ void Context::run(const Product& p, void* stream) {
             break;
         }
 #elif defined(STRATA_MMQ_KQUANTS)
-        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
-        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
-        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
-        case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
+        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K, GGML_PREC_Q8>(ctx, a, s); break;
+        case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1, GGML_PREC_Q8>(ctx, a, s); break;
 #endif
 #if !defined(GGML_USE_HIP)   // NVFP4: CUDA only (no HIP instance, no W4A8 unit)
         case GGML_TYPE_NVFP4:
