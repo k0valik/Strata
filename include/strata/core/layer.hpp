@@ -33,20 +33,18 @@
 #pragma once
 
 #include "strata/core/layout.hpp"
+#include "strata/core/vmm.hpp"
 #include "strata/core/weights.hpp"
 
 #include "strata/kernels/gr.hpp"
-#include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
 
-#include <cstdio>
-#include <functional>
-
-#include "strata/core/vmm.hpp"
-#include <cstdlib>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <vector>
 
 namespace strata::core {
 
@@ -171,9 +169,6 @@ bool moe_layer(const WeightTable& tables, const ModelGeometry& g, int64_t layer,
 /// rung, so a host that sees it knows `h_x_f`/`h_ids`/`h_weights` are in place.
 bool moe_route(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
                const float* x, void* stream, std::string& err, const Doorbell* db = nullptr);
-/// The verify window's n tokens routed at once (see layer.cpp); bitwise per token what `moe_route` gives.
-bool moe_route_window(const WeightTable& tables, const ModelGeometry& g, int64_t layer, int64_t k, const MoEBuffers& b,
-                      const float* x, float* logits, int32_t* ids, float* weights, int n, void* stream, std::string& err);
 
 /// The finishing half: the shared expert and the combination.
 ///
@@ -200,6 +195,10 @@ bool layer_shared_early();
 
 // ================================ the QSA mixer ================================
 
+/// The K/V storage of a QSA layer (`--kv`): FP16; INT8 codes with an FP16 scale per 64 values (kv_q8.hpp); 4-bit K
+/// and V of rotated rows (q4_0) or INT8 K with 4-bit V (k8v4; kv_q4.hpp).
+enum class KvFormat : int { F16 = 0, Int8 = 1, Q4 = 2, K8V4 = 3 };
+
 /// THE PERSISTENT STATE OF ONE QSA LAYER FOR ONE SEQUENCE: the KV cache, the indexer's pooled keys, the rope
 /// tables, and the per-token step buffer.  None of it is scratch - it survives every token.
 ///
@@ -207,41 +206,27 @@ bool layer_shared_early();
 /// shorter than the sequence would have `rope_neox_apply` read past it, which is a wrong rotation rather than a
 /// fault.
 struct QsaState {
-    uint16_t* k_pool = nullptr;      ///< [page][kv_head][page_size][head_dim] fp16 (null in INT8 mode)
+    KvFormat kv = KvFormat::F16;
+    uint16_t* k_pool = nullptr;      ///< [page][kv_head][page_size][head_dim] fp16 (KvFormat::F16)
     uint16_t* v_pool = nullptr;
-    /// Plan v0.3 P7: INT8 KV (qsa_set_kv_int8). Codes [page][kv_head][page_size][head_dim], one FP16 scale per 64.
-    bool kv_int8 = false;
+    /// Plan v0.3 P7: INT8 KV. Codes [page][kv_head][page_size][head_dim], one FP16 scale per 64 (K in K8V4 too).
+    bool kv_int8 = false;            ///< KvFormat::Int8: K and V
     int8_t* k_q = nullptr;
     int8_t* v_q = nullptr;
     uint16_t* k_scale = nullptr;
     uint16_t* v_scale = nullptr;
-    /// PR #21: Q4_0 KV with Walsh-Hadamard rotation (qsa_set_kv_q4, kv_q4.hpp): 144 B per cell and head
-    bool kv_q4 = false;
+    /// 4-bit KV (kv_q4.hpp): codes [page][kv_head][page_size][head_dim / 2], scales [...][head_dim / 32]; K in Q4,
+    /// V in Q4 and K8V4
     uint8_t* k_q4 = nullptr;
     uint8_t* v_q4 = nullptr;
-    /// Hybrid K8V4: K in INT8 (unrotated - the scores stay exact), V in rotated Q4_0 (kv_q4.hpp): 816 B per cell.
-    /// Uses k_q/k_scale + v_q4. Mode 0 only (no KV streaming, no ring); under this setting the MTP drafter's
-    /// ring state stays plain INT8, so the block movers never see the hybrid layout.
-    bool kv_hybrid = false;
-    /// K and V go through kv_q4.hpp's Walsh-Hadamard rotation before they are stored, the queries too, the output
-    /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)
-    bool kv_rot = false;
-    int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
+    uint16_t* k_q4s = nullptr;
+    uint16_t* v_q4s = nullptr;
+    int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page
     int64_t n_pages = 0;
     int64_t max_cells = 0;
-
-    /// KV STREAMING (docs/kv-streaming-design.md, `kv_stream.hpp`). `kv_mode` 0: every page in VRAM, identity
-    /// table (n_slots == n_pages, no host copy). 1: streamed - the authoritative K/V in `host`, `n_slots` pages
-    /// in VRAM, `map` resolves the selection's blocks on device. 2: a ring (the MTP drafter's window) - `n_slots`
-    /// pages at `block % n_slots`, with the host copy for a resume. The pool pointers above point at the slots.
-    int kv_mode = 0;
-    int64_t n_slots = 0;
-    /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the
-    /// context needs - its index in layer.cpp's registry; -1: carved from the arena as before.
+    /// The elastic K/V (qsa_set_kv_elastic): this state's pools are in a VMM range mapped only as far as the context
+    /// needs - its index in layer.cpp's registry; -1: carved from the arena as before.
     int32_t kv_elastic = -1;
-    strata::kernels::KvHostPools host;
-    strata::kernels::KvStreamMap map;
-    int64_t idx_pooled_rows = 0;     ///< rows of `idx_pooled` (a ring, which has no indexer, keeps 2)
 
     float* idx_tail = nullptr;       ///< (idx_block - 1, idx_dim): the raw tail of the block being filled
     float* idx_dead = nullptr;       ///< (idx_dim,): the spare slot's key, CONSTANT for the sequence
@@ -249,7 +234,6 @@ struct QsaState {
     int32_t* idx_block_pos = nullptr;
 
     float* cos_tab = nullptr;        ///< (max_cells, n_rot/2), built on the HOST in float64
-    bool owns_rope = false;          ///< built the table above (not borrowed with share_rope): it releases it
     float* sin_tab = nullptr;
 
     /// THE PER-TOKEN COUNTS, IN DEVICE MEMORY - the whole reason this layer can be a graph.  `qsa_step_fill`
@@ -273,19 +257,40 @@ struct QsaState {
     int32_t* host_pos = nullptr;     ///< (n_head,) pinned
 };
 
+/// The format of the model's QSA layers (`--kv`): set before sizing and initializing the session.
+void qsa_set_kv_format(KvFormat f);
+KvFormat qsa_kv_format();
+/// The MTP draft layer's: INT8 under the 4-bit formats (its K/V is one layer's, its drafts the speed).
+KvFormat qsa_draft_kv_format();
+
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
-/// instead of building a copy (the session builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
-/// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
-/// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
-/// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
-/// resident state).
-void qsa_set_kv_resident(int64_t cells);
-/// THE ELASTIC K/V (--kv-grow; vmm.hpp).  A mode-0 state's K/V pools get addresses for every cell of the context but
-/// physical memory only for the first `init_cells`; `qsa_kv_elastic_grow` maps more as the context grows (from
-/// chunks the expert cache gives up) and `qsa_kv_elastic_shrink` hands them back.  The addresses never move, so the
-/// captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
+/// instead of building a copy (the session builds it once, in the first QSA layer).  `kv`: the K/V format.
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true,
+                         KvFormat kv = qsa_kv_format());
+uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+                        const QsaState* share_rope = nullptr, KvFormat kv = qsa_kv_format());
+/// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
+/// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
+void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
+/// The attention kernels' view of the state's K/V pools (qsa_decode_attn.hpp).
+strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
+/// Appends n_tok cells in the state's format (graph-capturable): token t's step record at step + t * step_stride,
+/// its K and V rows at kcur/vcur + t * n_head_kv * head_dim (4-bit sides rotated and quantized here).
+void qsa_kv_append_steps(const QsaState& st, const ModelGeometry& g, const int32_t* step, int step_stride,
+                         const float* kcur, const float* vcur, int n_tok, void* stream);
+/// The state's K/V arrays, laid out [page][kv_head][page_size][...] (with an identity page table the first cells
+/// are one prefix of each), and their bytes per cell and KV head.
+struct KvArray {
+    void* data;
+    uint64_t row_bytes;
+};
+std::vector<KvArray> qsa_kv_arrays(const QsaState& st, const ModelGeometry& g);
+
+/// THE ELASTIC K/V (--kv-grow; vmm.hpp; after Niko1221/Strata 0.1.40).  A state's K/V pools get addresses for every
+/// cell of the context but physical memory only for the first `init_cells`; `qsa_kv_elastic_grow` maps more as the
+/// context grows (from chunks the expert cache gives up) and `qsa_kv_elastic_shrink` hands them back.  The addresses
+/// never move, so the captured graphs stay valid.  Set before sizing and initializing the session and the drafter.
 void qsa_set_kv_elastic(bool enabled, int64_t init_cells);
 bool qsa_kv_elastic();
 /// Cells every elastic state can hold now (INT64_MAX when none is elastic).
@@ -300,38 +305,6 @@ int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(VmmChunk)>
 /// Physical bytes the elastic pools hold, and what all of them would at the full context.
 uint64_t qsa_kv_elastic_mapped_bytes();
 uint64_t qsa_kv_elastic_full_bytes();
-int64_t qsa_kv_resident();
-/// The fewest resident cells a streamed layer may have: one verify window's selections (8 queries x 2,051 cells
-/// in whole blocks) must fit at once, with room to spare.
-int64_t qsa_kv_resident_min();
-/// Pinned host bytes the streamed states hold (their host copies).
-uint64_t qsa_kv_host_bytes();
-/// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
-/// initializing the session; default off until gate G-C accepts it.
-void qsa_set_kv_int8(bool enabled);
-/// INT8 K/V through the Hadamard rotation (off by default: STRATA_KV_ROT=1)
-void qsa_set_kv_int8_rotate(bool enabled);
-bool qsa_kv_int8();
-/// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
-void qsa_set_kv_q4(bool enabled);
-bool qsa_kv_q4();
-/// Hybrid K8V4 (`--kv k8v4`): K in INT8, V in rotated Q4_0 - 816 B per cell; streams with --kv-resident too.
-void qsa_set_kv_hybrid(bool enabled);
-bool qsa_kv_hybrid();
-/// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid).
-inline int qsa_kv_format(const QsaState& st) {
-    if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
-    return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
-}
-uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
-/// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
-strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
-void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
-                    int64_t cap, void* stream);
-/// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
-/// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
-void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
 
 // ================================ PER-STAGE TIMING, DEBUG ONLY ================================
 //
@@ -461,6 +434,7 @@ struct BlockBuffers {
     /// because the fused read of one half reads the other half's injection while writing its own.
     float* inject2 = nullptr;                 ///< hc
     float* gr_rs = nullptr;                   ///< hc: the fused read's per-stream 1/rms
+    float* gr_scratch = nullptr;              ///< `fused_gr_scratch_bytes()`: the fused read's scratch (session_zero)
     uint8_t* head_q8k = nullptr;              ///< `q8k_bytes(n_embd)`: the head's Q8_K activation image
     strata::kernels::GrWorkspace gr;          ///< `gr_read`'s scratch
 
@@ -514,6 +488,9 @@ uint64_t block_buffers_init(const ModelGeometry& g, void* base, BlockBuffers& b)
 /// from the kernel's would make the prompt embed differently from the tokens generated after it.
 bool embed_row(const WeightTable& tables, const ModelGeometry& g, int64_t token, float* out_dev, void* stream,
                std::string& err);
+/// embed_row for `n` token ids in DEVICE memory (checked by the caller) into out_dev [n, n_embd], one launch.
+bool embed_rows(const WeightTable& tables, const ModelGeometry& g, const int32_t* tokens_dev, int64_t n, float* out_dev,
+                void* stream, std::string& err);
 
 /// `ref/model.py` L520: `fin = GR.gr_read(R, output_hc_*..., inject=None, rms_eps); logits = output @ fin`.
 ///

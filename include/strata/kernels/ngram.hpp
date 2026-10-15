@@ -5,9 +5,9 @@
 //   * `ngram_rows` - the HOST hash.  Sixteen row indices per token from the last three token ids, computed
 //     with 64-bit multiply/xor and no tensor op at all.  `qwen4exp.cpp` L1092-1124, where the source says
 //     outright that it is host-side because "ggml has no int64 and no xor".
-//   * `PleTable`  - the row gather.  `per_layer_token_embd.weight` is IQ4_NL and is NOT IN THE PACK: it is
-//     51.2e9 elements (28.8 GB) in the ORIGINAL second GGUF shard, and it is the only tensor this engine
-//     reads from the GGUF rather than from the canonical pack.
+//   * `PleTable`  - the row gather.  `per_layer_token_embd.weight` is IQ4_NL (Q8_0 in the unsloth UD-Q5_K_XL and
+//     larger files) and is NOT IN THE PACK: it is 51.2e9 elements (28.8 GB; 54.4 GB as Q8_0) in the model's
+//     GGUF, and the engine reads it from there.
 //
 // THE HASH IS THE ONE PLACE IN THIS MODEL WHERE A WRONG BIT IS SILENTLY PLAUSIBLE.  Every one of its
 // properties has a rival reading that produces a valid index in range:
@@ -24,6 +24,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace strata::kernels {
 
@@ -44,37 +45,8 @@ inline constexpr float NG_RMS_EPS = 1e-6f;
 // The table: [160, 320001536] IQ4_NL.  ne0 = 160 is the FAST axis, so one row is 160 contiguous elements =
 // 5 blocks of 32 at 18 bytes = 90 bytes.  The head-slowest flatten then makes 16 rows exactly n_embd = 2560.
 inline constexpr uint64_t PLE_TABLE_ROWS = 320001536ull;
-inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90: an IQ4_NL row
-inline constexpr int PLE_ROW_BYTES_FP8 = PLE_HEAD_DIM;                   // 160: an F8_E4M3 row, one byte a value
-inline constexpr int PLE_ROW_BYTES_Q5_1 = (PLE_HEAD_DIM / 32) * 24;     // 120: a Q5_1 row (a Q5_K_M finetune)
-inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;     // 170: a Q8_0 row (UD-Q6_K_XL, Swift-1.5 Q4_K_L)
-inline constexpr int PLE_ROW_BYTES_BF16 = PLE_HEAD_DIM * 2;             // 320: a BF16 row, two bytes a value
-inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;             // the widest row any format in `ple_formats()` has
-
-/// THE FORMATS OF THE TABLE, ONE ROW EACH. A table type is one entry here (its GGUF type name, the bytes of one
-/// 160-value row, how to turn a row into floats) and nothing else: `PleTable::open`, `format()`, the reader's row size,
-/// the error string and the buffers' size all read this list, so a new format cannot be in one switch and missing from
-/// another. A row is always `PLE_HEAD_DIM` = 160 values = 5 blocks of 32 for the block formats.
-enum class PleFormat : uint8_t { IQ4_NL, Q5_0, F8_E4M3, Q5_1, Q8_0, Q4_0, BF16 };
-
-struct PleFormatInfo {
-    PleFormat id;
-    const char* name;          ///< what `PleTable::format()` returns
-    const char* gguf_type;     ///< `TensorInfo::type_name()` of the table tensor ("I8" for F8_E4M3: GGUF has no FP8 type)
-    uint32_t row_bytes;        ///< bytes of one 160-value row in the file
-    bool needs_scale;          ///< the table has one scale in the GGUF metadata (`strata.ple.scale`), F8_E4M3 only
-    void (*dequant)(const uint8_t* row, float scale, float* out160);
-};
-
-/// Every format, in the order of `PleFormat`; `ple_format_count()` entries.
-const PleFormatInfo* ple_formats();
-int ple_format_count();
-const PleFormatInfo& ple_format_info(PleFormat f);
-/// The format whose table tensor has this GGUF type name, or nullptr. F8_E4M3's name is "I8"; the caller checks the
-/// `strata.ple.format` marker and the scale.
-const PleFormatInfo* ple_format_for_type(const char* gguf_type_name);
-/// "IQ4_NL, Q5_0 or FP8 (I8)": the formats for an error message, built from the list.
-std::string ple_format_list();
+inline constexpr int PLE_ROW_BYTES = (PLE_HEAD_DIM / 32) * 18;           // 90
+inline constexpr int PLE_ROW_BYTES_Q8_0 = (PLE_HEAD_DIM / 32) * 34;      // 170, the Q8_0 tables
 
 /// The artifact's own hash constants, transcribed from `docs/gguf-dump-shard1.txt`:
 ///
@@ -125,43 +97,29 @@ int iq4nl_code(int code);
 /// so byte j carries elements j and j+16 - NOT 2j and 2j+1, which is the natural reading and which produces
 /// a perfectly plausible embedding of the wrong 160 values.
 void iq4nl_dequant_row(const uint8_t* row, float* out160);
-
-/// One FP8 row -> 160 floats: each byte an E4M3 value (the "fn" variant: no infinities, 0x7F/0xFF are NaN), times the
-/// table's one scale. This is the table as Qwen3.8-Flash-Next ships it (`...ngram_embedding.shard_k`, F8_E4M3, and
-/// `weight_scale`), kept byte for byte by tools/ple_fp8_pack.py; IQ4_NL is 8% off it per row.
-void fp8_e4m3_dequant_row(const uint8_t* row, float scale, float* out160);
-
-/// One BF16 row -> 160 floats, EXACTLY: bfloat16 is the top half of a float32, so this is a shift and a copy with no
-/// rounding anywhere. It is the other published form of this same table - the full checkpoint stores
-/// `...ngram_embedding.shard_k` as BF16 (2 B a value, 102.4 GB), the source of record rather than a re-quantization.
-/// There is no scale, because BF16 values are the values.
-void bf16_dequant_row(const uint8_t* row, float* out160);
+/// One row of a table of GGML type `type` (IQ4_NL = 20 or Q8_0 = 8) -> 160 floats.
+void ple_dequant_row(int type, const uint8_t* row, float* out160);
 
 /// How the table's rows are read (plan v0.3 P2). `Direct` is the default: unbuffered 4 KiB reads from the SSD,
 /// so the table never occupies RAM or the OS file cache. `Mmap` is the earlier memory-mapped path, kept as the
-/// A/B arm; it returns the same bytes.
+/// A/B arm; it returns the same bytes. `Ram`: Direct until `start_ram_load` has read the whole table into RAM
+/// (unbuffered, so the file cache holds no second copy), then from RAM: a 16K-token prompt chunk's 262K random
+/// row reads take ~0.6 s from the SSD.
 ///
 /// NEVER KEEP THE SHARD MAPPED WHILE READING IT DIRECT: a live section on the same file serializes the unbuffered
 /// reads (311 -> 1,575 us per token, bench/results/2026-09-23-p2-ssd-direct). Direct mode drops its own mapping
 /// after the header parse; nothing else in the process may hold one.
-enum class PleIo { Direct, Mmap };
+enum class PleIo { Direct, Mmap, Ram };
 
 struct PleIoOptions {
     PleIo mode = PleIo::Direct;
-    uint32_t max_inflight = 256;     ///< outstanding SSD reads (decode needs 16; a prompt chunk saturates the SSD at 256)
-    uint64_t cache_rows = 1u << 20;  ///< bounded row cache, in ROWS: 1,048,576 x 90 B ~ 95 MB (IQ4_NL), ~160 MB (FP8),
-                                     ///< ~335 MB (BF16); 0 disables
+    uint32_t max_inflight = 64;      ///< outstanding SSD reads (decode needs 16; prefill chunks use more)
+    uint64_t cache_rows = 1u << 20;  ///< bounded row cache: 1,048,576 rows x 90 B ~ 95 MB; 0 disables
     bool io_thread = true;           ///< reads submitted by a worker thread, not the caller
-    /// Mmap mode only (`--ple-io ram`): lock the whole mapped table in RAM at open, so no SSD read ever sits on
-    /// the prompt or token path. Needs RAM for the full table (28.8 GB IQ4_NL, 51.2 GB FP8). mlock on POSIX,
-    /// the process working-set minimum plus VirtualLock on Windows; `locked()` reports the outcome.
-    bool lock = false;
-    /// Direct mode with the I/O worker only: keep the SSD awake while rows are asked for - one page of the table
-    /// after this long without a read (0 = off), until `keepalive_window_s` after the last request for rows
-    /// (see PleReader::set_keepalive).
-    double keepalive_ms = 0;
-    double keepalive_window_s = 60;
 };
+
+/// The shard among `shards` that holds `per_layer_token_embd.weight`, or "" (headers only).
+std::string ple_table_shard(const std::vector<std::string>& shards);
 
 /// The PLE table.  Held by pointer-to-impl so this header does not drag `<windows.h>` into every
 /// translation unit that wants the hash.
@@ -179,16 +137,29 @@ public:
     /// needs the rows. `gather` is `issue` followed by `collect`. In Mmap mode `issue` only prefetches.
     bool issue(const uint32_t* rows16);
     bool collect(float* out2560, std::string& err);
-    /// Non-blocking prefetch of 16 rows for one token into the reader's row cache while the GPU is busy.
-    void prefetch_rows(const uint32_t* rows16);
-    void wait_prefetches();
     /// Plan v0.3 P5: the rows of `n_tokens` tokens (16 each, `rows` token-major) into `out` (2560 floats per token),
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
 
+    /// Tokens read ahead, each in a slot of its own beside issue/collect: `ahead` starts reading a token's 16 rows
+    /// (a slot still holding other rows waits for them first; outside Direct mode the rows are only recorded),
+    /// `ahead_holds` tells whether a slot holds exactly these rows, `ahead_collect` waits and gives the 2560 floats.
+    static constexpr int kAheadSlots = 8;
+    void ahead(int slot, const uint32_t* rows16);
+    bool ahead_holds(int slot, const uint32_t* rows16) const;
+    bool ahead_collect(int slot, float* out2560, std::string& err);
+
     /// Fault injection (Direct mode): every row read completes no earlier than `us` after issue.
     void set_injected_delay_us(double us);
+
+    /// Ram mode: reads the table into (pageable) RAM on a thread of its own; the rows come from the SSD until it is
+    /// done.  Reports on stderr when done.
+    bool start_ram_load(std::string& err);
+    bool ram_ready() const;
+    /// Ram mode: waits for start_ram_load's thread to finish (the table in RAM, or its failure reported); returns at
+    /// once if no load is running.
+    void wait_ram_load();
 
     /// Maps the ORIGINAL second GGUF shard read-only.  The tensor's data does NOT start at file offset 0:
     /// the manifest's `shard2_tensor.offset` is relative to the GGUF's DATA SECTION, and the header before it
@@ -198,11 +169,7 @@ public:
     bool open(const std::string& gguf_path, std::string& err);
     void close();
     bool is_open() const;
-    /// True when `PleIoOptions::lock` was asked for and the OS lock succeeded (false: pages only pre-touched).
-    bool locked() const;
     uint64_t rows() const;
-    /// "IQ4_NL" or "F8_E4M3" (a GGUF from tools/ple_fp8_pack.py: type I8, strata.ple.format = f8_e4m3).
-    const char* format() const;
 
     /// 16 row indices -> 2560 floats.  The gathered rows are flattened HEAD-SLOWEST: row h's 160 values
     /// occupy `out[h*160, (h+1)*160)`, which is what `ggml_get_rows` does and what makes the result a plain

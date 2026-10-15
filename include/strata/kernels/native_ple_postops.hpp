@@ -27,19 +27,21 @@ void native_ple_postops(const float* projected_key, const float* hidden,
                         const PleWeights& weights, const NativePlePostopsBuffers& buffers,
                         void* stream);
 
-/// The prompt path: T tokens at once, element for element the arithmetic of T calls of native_ple_postops with
-/// the history advanced after each.  `key` (T x 10240) holds the projected keys and is normalized in place;
-/// `hidden` (T x 10240) becomes the result; `value` T x 2560; `query_norm` (T x 10240, the normalized hidden, then
-/// the normalized gated values), `gated` (T x 10240) and `gate` (T x 4) are scratch; `history` (9 rows per
-/// channel) is advanced past the T tokens.
-void native_ple_postops_batch(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
-                              float* query_norm, float* gated, float* gate, int T, void* stream);
-
-/// The verify window: native_ple_postops_batch whose norms divide by the column count at run time, exactly as
-/// native_gr_rms_norm_weighted (the per-token path's) does, so every value is bitwise that of T native_ple_postops
-/// calls with the history advanced after each; it also writes `snap` (T x 9 x 10240): the history after each token,
-/// as the per-token path's copies leave it for the commit.
-void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
-                                   float* query_norm, float* gated, float* gate, int T, float* snap, void* stream);
+// n_tok consecutive tokens (the prompt path, a verify window's group), row-major with the token slow: projected_key,
+// hidden, key, query, gated, normalized and result [n_tok, 10240], value [n_tok, 2560], gate [n_tok, 4]. Bitwise
+// n_tok calls of native_ple_postops, each followed by ple_history_advance: history is read, then left holding the
+// last nine normalized rows; `snaps` (optional, [n_tok, 9 * 10240]) receives the history after each token. result
+// may equal hidden and query may equal normalized; nothing else may overlap.
+struct NativePleTokensBuffers {
+    float* key;
+    float* query;
+    float* gate;
+    float* gated;
+    float* normalized;
+    float* result;
+};
+void native_ple_postops_tokens(const float* projected_key, const float* hidden, const float* value,
+                               float* history, const PleWeights& weights, const NativePleTokensBuffers& buffers,
+                               int n_tok, void* stream, float* snaps = nullptr);
 
 } // namespace strata::kernels

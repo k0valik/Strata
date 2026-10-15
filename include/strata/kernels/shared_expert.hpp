@@ -24,7 +24,7 @@ namespace strata::kernels {
 /// Configure before session capture; captured graphs retain their selected kernels.
 /// In this mode shared_expert requires its optional unrounded x_f32 input.
 void shared_expert_set_native_bf16(bool enabled);
-bool shared_expert_native_bf16_enabled();
+bool shared_expert_native_bf16();
 
 /// Optional native GGUF projections. Each supported type with nonnull data
 /// replaces only that canonical projection; absent or unsupported entries fall
@@ -38,7 +38,7 @@ struct NativeSharedWeights {
     const void* up_data = nullptr;
     const void* down_data = nullptr;
     void* q8_1 = nullptr;
-    const void* x_q8_1 = nullptr;   // optional pre-quantized Q8_1 input for gate/up in shared_expert_multi
+    void* q8_1_il = nullptr;   // shared_expert_multi: the interleaved copy of 2+ tokens' inputs (native_q8_1_il_bytes)
 };
 
 /// Bytes of caller-owned scratch `shared_expert` needs.  **THE KERNEL USED TO `cudaMalloc` FOUR BUFFERS ON
@@ -70,17 +70,20 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                    int64_t n_embd, int64_t n_ff, int tpr, void* stream, const float* x_f32 = nullptr,
                    const NativeSharedWeights* native = nullptr);
 
-/// Plan v0.3 P6: the shared expert for `n_tok` <= 8 tokens (a verify window) with all three projections native:
-/// multi-column MMVQ, so the weights are read once; every token is bitwise `shared_expert` on that token.
-/// `x` (n_tok, n_embd) f32, `x_bf16` the same rounded (only read when the native BF16 gate is off), `gate`/`up`
-/// (n_tok, n_ff) scratch, `g` n_tok floats, `out` (n_tok, n_embd).  `nw.q8_1` must hold n_tok columns of n_embd.
-/// x_q8_1_ready: the q8_1 image of x (n_tok rows), already quantized by the caller with the same quantizer (the
-/// same bytes native_quantize_q8_1 writes): its gate/up read it and x is not quantized again, and the SwiGLU and
-/// its q8_1 run as one launch (same values). Null: the separate launches.
-void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
-                         const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
-                         int64_t n_ff, void* stream, const void* x_q8_1_ready = nullptr,
-                         int lfuse = 0);   // S26 STRATA_LFUSE: bit 0 gate computed + applied by the caller, bit 1 gate/up pair
+/// The native scalar gate applied: `g` (n_tok logits) becomes sigmoid(g), and each token's row of `out` (n_tok,
+/// n_embd) is multiplied by it.
+void shared_expert_gate_rows(float* out, float* g, int64_t n_embd, int n_tok, void* stream);
+
+/// Plan v0.3 P6: the shared expert for `n_tok` <= 8 tokens (a verify window) with all three projections and the gate
+/// native: multi-column MMVQ, so the weights are read once.  `x` (n_tok, n_embd) f32, `gate`/`up` (n_tok, n_ff)
+/// scratch; `out` (n_tok, n_embd) receives the down projection's rows and `g` the scalar gate's n_tok logits,
+/// computed on `gate_stream` (may be `stream`), so that the chain ends with the down projection:
+/// `shared_expert_gate_rows` on them, or `native_moe_gather_combine` applying them, gives every token bitwise
+/// `shared_expert` on that token.  `nw.q8_1` must hold n_tok columns of n_embd; with `nw.q8_1_il` 2+ tokens' gate and
+/// up projections run through `native_mmvq_il` (IQ3_S's weights decoded once for all tokens).
+void shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& nw, const uint16_t* gate_inp_bf16,
+                         float* gate, float* up, float* g, float* out, int64_t n_embd, int64_t n_ff, void* stream,
+                         void* gate_stream);
 
 /// The MoE block's final combination, `ref/moe.py::moe` L156:
 ///

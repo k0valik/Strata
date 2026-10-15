@@ -20,14 +20,13 @@ public:
     ~NativeDense();
     NativeDense(const NativeDense&) = delete;
     NativeDense& operator=(const NativeDense&) = delete;
-    /// With layer_hi >= 0, only the `blk.<l>.` matrices with layer_lo <= l < layer_hi are uploaded (a layer
-    /// split's stage holds its own layers' projections, not the whole model's); the others keep data == nullptr.
     bool load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-              bool include_ple_key = false, int64_t layer_lo = 0, int64_t layer_hi = -1);
+              bool include_ple_key = false);
     /// Plan v0.3 P1: the canonical tensor names `load` would serve natively from these shards (eligible name,
     /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
                              std::set<std::string>& out, std::string& err);
+<<<<<<< this fork
     /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage; the
     /// PLE tensors are loaded everywhere).  Process-wide, read by the next `load`; (-1, -1) = all layers.
     static void set_layer_range(int lb, int le);
@@ -52,16 +51,14 @@ public:
     /// event wait on an outside event is illegal). The scratches are allocated by `load`, never on first use.
     static const uint16_t* hc_bf16_view(const WeightRef& w, void* stream, int slot, int cls);
     static void hc_bf16_release(void* stream, int slot, int cls);
+=======
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
     uint64_t weight_bytes() const { return bytes_; }
-    /// What the device lost to `load`: each matrix rounded up to the granule `cudaMalloc` backs it with.
-    uint64_t allocated_bytes() const { return allocated_; }
-    size_t tensor_count() const { return weights_.size() - packed_keys_.size(); }
+    size_t tensor_count() const { return weights_.size(); }
 
 private:
     std::vector<void*> weights_;
-    std::vector<const void*> packed_keys_;   // GGUF-layout pointers registered with STRATA_Q8_PACKED=1
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
-    uint64_t allocated_ = 0;
 };
 } // namespace strata::core

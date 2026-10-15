@@ -15,23 +15,17 @@ bool native_moe_combine_enabled();
 // Requires a nonnull ordered stream and disjoint output. No allocation or sync.
 void native_moe_combine(const float* parts, const float* weights, const float* shared,
                         float* output, int64_t n_embd, int64_t k, void* stream);
-/// n_tok rows (parts [n,k,N], weights [n,k], shared/output [n,N]) in one launch, each as the single call.
-/// 143-amdk: native_moe_combine_multi with moe_hit_add folded in: for the rows listed in dst[0, *count) (entry index = token * k + expert,
-/// relative to `parts` and `hits`) the expert's part is parts + hits (the add moe_hit_add made in place), then the combine as before.
-/// Only the k = 10 vec4 case; `native_moe_combine_hits_supported` says whether a call may use it.
-bool native_moe_combine_hits_supported(const float* parts, const float* shared, const float* output, int64_t n_embd, int64_t k, int n_tok);
-void native_moe_combine_multi_hits_added(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
-                                         const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k,
-                                         int n_tok, void* stream);
-void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
-                              int64_t n_embd, int64_t k, int n_tok, void* stream);
-/// STRATA_VERIFY_RESIDENT: the same, reading every part as `0.0f + hit[i]` - bitwise what a zeroed part row plus
-/// moe_hit_add (parts += hit) gave, without the zero fill and the add launch.
-void native_moe_combine_multi_hits(const float* hits, const float* weights, const float* shared, float* output,
-                                   int64_t n_embd, int64_t k, int n_tok, void* stream);
-/// S26 STRATA_LFUSE: the same with `shared` unscaled and shared_gate[t] the shared expert's raw gate logit: the
-/// row is scaled by sigmoid(shared_gate[t]) here, bitwise what shared_expert_multi's sigmoid + scale gave.
-void native_moe_combine_multi_hits_gated(const float* hits, const float* weights, const float* shared,
-                                         const float* shared_gate, float* output, int64_t n_embd, int64_t k, int n_tok,
-                                         void* stream);
+
+// The verify window's combine for n_tok tokens, bitwise `native_moe_combine` per token over the rows the window
+// used to assemble: row t*k + j comes from `gpu_rows` (row-indexed) as the host's zeroed row plus the hit when an
+// entry of dst[0..*count) or dst2[0..*count2) names it, as it is when an entry of dst3[0..*count3) does, and
+// otherwise from `host_rows` (mapped memory: only these rows cross PCIe).  `dst2` and `dst3` may be null.
+// weights (n_tok, k), shared and output (n_tok, n_embd).  With `shared_gate` (n_tok logits of the shared expert's
+// scalar gate, shared_expert_multi) the shared rows are its down projection's, and each is gated first, bitwise
+// shared_expert_gate_rows.  Graph-capturable.
+void native_moe_gather_combine(const float* gpu_rows, const float* host_rows, const int32_t* dst,
+                               const int32_t* count, const int32_t* dst2, const int32_t* count2, const int32_t* dst3,
+                               const int32_t* count3, const float* weights, const float* shared,
+                               const float* shared_gate, float* output, int64_t n_embd, int64_t k, int n_tok,
+                               void* stream);
 }

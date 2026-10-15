@@ -12,6 +12,7 @@ namespace strata::prefill::mmq {
 
 /// This build has the MMQ path (the ggml sources were available to the build).
 bool built();
+<<<<<<< this fork
 /// MMQ covers this ggml type (the i-quants and Q2_0 the packs use, Q8_0, NVFP4 unless fp16, and with
 /// STRATA_MMQ_KQUANTS the K-quants Q4_K / Q5_K / Q5_1 / Q6_K: Unsloth's UD-Q4_K_XL experts (CUDA), and the dense GGUF
 /// projections of the mixed-quant packs through Gemm::native's STRATA_DENSE_MMQ path (HIP); IQ1_M is not covered).
@@ -25,6 +26,11 @@ bool fits(int ggml_type, int64_t w_rows);
 /// fp16); fp16 - the dequantize + FP16 GEMM path (the reference).
 enum class Nvfp4Mode { W4A8, W4A4, FP16 };
 Nvfp4Mode nvfp4_mode();
+=======
+/// MMQ covers this ggml type (the i-quants and Q2_0 of ISTA-DASLab's files, the K-quants, Q5_1 and Q8_0 of
+/// unsloth's; IQ1_M is not covered).
+bool supported(int ggml_type);
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
 /// Bytes of one expert's gate+up ([2*n_ff, n_embd]) or down ([n_embd, n_ff]) weights in `ggml_type`.
 size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
@@ -84,6 +90,7 @@ private:
 /// `tail` (16 bytes, may be null) goes to `tail_dst`; `zero_bytes` zeroed right after gu_dst's and d_dst's copies
 /// (the MMQ tail after a group's last expert).
 void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const void* down, size_t d_bytes,
+<<<<<<< this fork
                    void* gu_dst, void* d_dst, void* stream, const void* tail = nullptr, void* tail_dst = nullptr,
                    size_t zero_bytes = 0);
 /// gather_native for an MMQ group's experts [first, n) in ONE launch: expert q's blob (`blob[q]`; gate at +0, up at
@@ -99,6 +106,9 @@ struct GatherGroup {
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
                          void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream,
                          size_t tail_off = 0, void* tail_dst = nullptr, size_t zero_bytes = 0);
+=======
+                   void* gu_dst, void* d_dst, void* stream);
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
 /// A Strata-pack Q2_0 expert blob (codes and fp16 scales in separate planes, gate/up rows interleaved) into GGUF
 /// Q2_0 blocks: gate/up [1280, 2560] at `gu_dst` (rows stay interleaved), down [2560, 640] at `d_dst`.  Same values.
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream);
@@ -114,10 +124,5 @@ void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);
-
-/// y[i] = float(x[i]) for FP16 bits x.
-void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream);
-/// dst = {0, rows} (the bounds of one matrix; dst on the device).
-void set_bounds(int32_t* dst, int32_t rows, void* stream);
 
 }  // namespace strata::prefill::mmq
