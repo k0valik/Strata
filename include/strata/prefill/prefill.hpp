@@ -161,6 +161,10 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, Prefill* next) {
         stage_lb_ = layer_begin; stage_le_ = layer_end; next_ = next;
     }
+    /// Wait until this stage's downstream calls (and theirs) have finished; the first stage's `run` does it before it
+    /// returns.  A later stage's `run` (one chunk) returns once its own chunk is handed on, so every stage of a chain of
+    /// 3+ works on its own chunk at once instead of each waiting for the whole chain below it.
+    bool drain(std::string& err);
 
     /// LAYER SPLIT: `helper` is another stage's prompt path (another GPU).  A prompt of one chunk runs the stages one
     /// after the other, so while this stage reads it the helper's GPU idles: it then streams a share of this stage's

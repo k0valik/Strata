@@ -36,6 +36,10 @@ public:
     /// shape (so the caller falls back to bf16(), with the same ldx).
     bool bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K);
 
+    /// Y = X . W^T with both in FP32 (STRATA_FP16=load: the F32 gates).
+    void f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
+             float beta = 0.0f);
+
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
@@ -67,6 +71,8 @@ private:
     void* workspace_ = nullptr;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
+    uint16_t* w16_ = nullptr;    ///< STRATA_PREFILL_F16: the BF16 weight converted to FP16
+    int64_t w16_elems_ = 0;
     bool f16_io_ = false;
     /// cuBLAS 12 answers the default FP16 algorithm of a few (N, K) shapes with CUBLAS_STATUS_INTERNAL_ERROR once
     /// another CUDA device in the process has initialized its context (issue #1650, Turing + Pascal).  A fixed

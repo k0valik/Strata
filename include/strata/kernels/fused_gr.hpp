@@ -36,6 +36,7 @@ struct FusedGrArgs {
     float* rs = nullptr;               ///< workspace, hc floats
     float* inject_out = nullptr;       ///< hc floats (when w_inject)
     float* mixed = nullptr;            ///< n_embd
+    bool w_f16 = false;                ///< STRATA_FP16=load: w_down / w_up / w_inject hold FP16 bits, not BF16
     /// S23 experiment (STRATA_HC_Q8=1): the GGUF's Q8_0 projections (null: the BF16 ones above); fused_gr_read_multi
     /// only
     const uint8_t* q8_down = nullptr;  ///< Q8_0 [hc_lr][hc*n_embd]

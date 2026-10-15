@@ -3,6 +3,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/pdl.hpp"
 
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <cstdlib>
 #include <limits>
@@ -43,23 +44,39 @@ __device__ __forceinline__ float mmvf_warp_sum(float value) {
     return value;
 }
 
-template <int BLOCK_SIZE>
-__global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+// weight pair `pair` of a row in form WF (0 BF16, 1 FP16, 2 F32), widened to FP32
+template <int WF>
+__device__ __forceinline__ void mmvf_pair(const void* row, int pair, float& w0, float& w1) {
+    if constexpr (WF == 2) {
+        const float2 v = reinterpret_cast<const float2*>(row)[pair];
+        w0 = v.x; w1 = v.y;
+    } else {
+        const uint32_t v = reinterpret_cast<const uint32_t*>(row)[pair];
+        if constexpr (WF == 0) { w0 = f32_from_bf16((uint16_t) v); w1 = f32_from_bf16((uint16_t) (v >> 16)); }
+        else { w0 = __half2float(__ushort_as_half((uint16_t) v)); w1 = __half2float(__ushort_as_half((uint16_t) (v >> 16))); }
+    }
+}
+template <int WF> __device__ __forceinline__ const void* mmvf_row(const void* w, int n_in) {
+    return reinterpret_cast<const char*>(w) + (size_t) blockIdx.x * n_in * (WF == 2 ? 4 : 2);
+}
+
+template <int BLOCK_SIZE, int WF = 0>
+__global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const void* __restrict__ w,
                                     float* __restrict__ y, int n_in) {
     const int t = threadIdx.x;
-    const uint16_t* row = w + (size_t) blockIdx.x * n_in;
-    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
+    const void* row = mmvf_row<WF>(w, n_in);
     const float2* inputs2 = reinterpret_cast<const float2*>(x);
     __shared__ float partials[32];
     if (t < 32) partials[t] = 0.0f;
     __syncthreads();
     float acc = 0.0f;
     for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
-        const uint32_t weight = weights2[pair];
+        float w0, w1;
+        mmvf_pair<WF>(row, pair, w0, w1);
         const float2 input = inputs2[pair];
         // Match the two ordered multiply-adds in ggml_cuda_mad, not a pair sum followed by one add.
-        acc = __fmaf_rn(f32_from_bf16((uint16_t) weight), input.x, acc);
-        acc = __fmaf_rn(f32_from_bf16((uint16_t) (weight >> 16)), input.y, acc);
+        acc = __fmaf_rn(w0, input.x, acc);
+        acc = __fmaf_rn(w1, input.y, acc);
     }
     acc = mmvf_warp_sum(acc);
     if constexpr (BLOCK_SIZE > 32) {
@@ -74,14 +91,13 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
 // the same kernel for up to 8 activation rows - the weight row is read ONCE and every
 // token keeps its own accumulator with exactly the single-row kernel's order (pairs, two ordered FMAs, the same warp
 // and block reductions), so each output is bit-identical to a bf16_f32_mmvf_kernel launch of its own.
-template <int BLOCK_SIZE, int NT, bool EXACT_T = true>
-__global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const uint16_t* __restrict__ w,
+template <int BLOCK_SIZE, int NT, int WF = 0, bool EXACT_T = false>
+__global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const void* __restrict__ w,
                                           float* y_, int64_t ldy, int n_in, int n_tok) {
     const float* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
     float* STRATA_PDL_RESTRICT y = y_;
     const int t = threadIdx.x;
-    const uint16_t* row = w + (size_t) blockIdx.x * n_in;
-    const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
+    const void* row = mmvf_row<WF>(w, n_in);
     __shared__ float partials[NT][32];
     if (t < 32) {
 #pragma unroll
@@ -91,19 +107,12 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const u
     float acc[NT];
 #pragma unroll
     for (int k = 0; k < NT; ++k) acc[k] = 0.0f;
-    // PDL (pdl.hpp): this thread's first PRE weight pairs are loaded before waiting for the activations
-    constexpr int PRE = kPdlPrefetch ? 8 : 0;
-    uint32_t wpre[PRE > 0 ? PRE : 1];
-#pragma unroll
-    for (int q = 0; q < PRE; ++q) {
-        const int pair = t + q * BLOCK_SIZE;
-        wpre[q] = pair < n_in / 2 ? __ldg(weights2 + pair) : 0u;
-    }
+    // PDL (pdl.hpp): a no-op below sm_90 and outside the verify window; ac922 keeps the plain loop of every weight
+    // form here (upstream's prefetch of the first BF16 pairs before the wait is not taken)
     pdl_wait();
-    int q = 0;
-    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE, ++q) {
-        const uint32_t weight = q < PRE ? wpre[q] : __ldg(weights2 + pair);
-        const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
+    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+        float w0, w1;
+        mmvf_pair<WF>(row, pair, w0, w1);
 #pragma unroll
         for (int k = 0; k < NT; ++k) {
             if (EXACT_T || k < n_tok) {
@@ -294,62 +303,80 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
-    if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
+    gemv_fp32_mmvf_multi(x, ldx, w, WForm::Bf16, y, ldy, n_in, n_out, n_tok, stream);
+}
+
+void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, void* stream) {
+    gemv_fp32_mmvf(x, w, WForm::Bf16, y, n_in, n_out, stream);
+}
+
+void gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const void* w, WForm f, float* y, int64_t ldy,
+                          int64_t n_in, int64_t n_out, int n_tok, void* stream) {
+    if (n_tok == 1 && ldy >= n_out) { gemv_fp32_mmvf(x, w, f, y, n_in, n_out, stream); return; }
     if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
-        w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
+        w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0 ||
+        (f == WForm::F32 && (reinterpret_cast<uintptr_t>(w) & 7u) != 0))
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
     const cudaStream_t st = (cudaStream_t) stream;
+    // STRATA_MMVF_ROWS=1 (upstream's opt-in row kernel) reads BF16 only: other weight forms (STRATA_FP16=load) below
     static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
-    if (rows && n_out >= 64) {
+    if (rows && n_out >= 64 && f == WForm::Bf16) {
         const int ni = (int) n_in, no = (int) n_out;
+        const uint16_t* wb = static_cast<const uint16_t*>(w);
         switch (mmvf_block_size(n_in)) {
-            case 32: launch_rows<32>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
-            case 64: launch_rows<64>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
-            case 96: launch_rows<96>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
-            case 128: launch_rows<128>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
-            case 160: launch_rows<160>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
-            case 192: launch_rows<192>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
-            case 224: launch_rows<224>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
-            default: launch_rows<256>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
+            case 32: launch_rows<32>(x, ldx, wb, y, ldy, ni, no, n_tok, st); break;
+            case 64: launch_rows<64>(x, ldx, wb, y, ldy, ni, no, n_tok, st); break;
+            case 96: launch_rows<96>(x, ldx, wb, y, ldy, ni, no, n_tok, st); break;
+            case 128: launch_rows<128>(x, ldx, wb, y, ldy, ni, no, n_tok, st); break;
+            case 160: launch_rows<160>(x, ldx, wb, y, ldy, ni, no, n_tok, st); break;
+            case 192: launch_rows<192>(x, ldx, wb, y, ldy, ni, no, n_tok, st); break;
+            case 224: launch_rows<224>(x, ldx, wb, y, ldy, ni, no, n_tok, st); break;
+            default: launch_rows<256>(x, ldx, wb, y, ldy, ni, no, n_tok, st); break;
         }
         const cudaError_t result = cudaGetLastError();
         if (result != cudaSuccess)
             throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi launch: ") + cudaGetErrorString(result));
         return;
     }
-#define STRATA_MMVF_M(N) case N: \
+#define STRATA_MMVF_MF(N, WF) \
     switch (n_tok) { \
-        case 1: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 1, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        case 2: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 2, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        case 3: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 3, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        case 4: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        case 5: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 5, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        case 6: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 6, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-        default: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8, false>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
-    } break
+        case 1: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 1, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 2: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 2, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 3: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 3, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 4: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 5: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 5, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        case 6: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 6, WF, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+        default: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8, WF, false>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
+    }
+#define STRATA_MMVF_M(N) case N: \
+    if (f == WForm::Bf16) { STRATA_MMVF_MF(N, 0); } else if (f == WForm::F16) { STRATA_MMVF_MF(N, 1); } \
+    else { STRATA_MMVF_MF(N, 2); } break
     switch (mmvf_block_size(n_in)) {
         STRATA_MMVF_M(32); STRATA_MMVF_M(64); STRATA_MMVF_M(96); STRATA_MMVF_M(128);
         STRATA_MMVF_M(160); STRATA_MMVF_M(192); STRATA_MMVF_M(224); STRATA_MMVF_M(256);
     }
 #undef STRATA_MMVF_M
+#undef STRATA_MMVF_MF
     const cudaError_t result = cudaGetLastError();
     if (result != cudaSuccess)
         throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi launch: ") + cudaGetErrorString(result));
 }
 
-void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
-                         int64_t n_in, int64_t n_out, void* stream) {
+void gemv_fp32_mmvf(const float* x, const void* w, WForm f, float* y, int64_t n_in, int64_t n_out, void* stream) {
     if (n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
         n_out <= 0 || n_out > std::numeric_limits<int>::max())
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: require positive even n_in and positive n_out <= INT_MAX");
     if (x == nullptr || w == nullptr || y == nullptr ||
         (reinterpret_cast<uintptr_t>(x) & 7u) != 0 ||
-        (reinterpret_cast<uintptr_t>(w) & 3u) != 0 ||
+        (reinterpret_cast<uintptr_t>(w) & (f == WForm::F32 ? 7u : 3u)) != 0 ||
         (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf: null or misaligned pointer");
     const cudaStream_t st = (cudaStream_t) stream;
 #define STRATA_MMVF_CASE(N) case N: \
-    bf16_f32_mmvf_kernel<N><<<(unsigned) n_out, N, 0, st>>>(x, w, y, (int) n_in); break
+    if (f == WForm::Bf16) bf16_f32_mmvf_kernel<N, 0><<<(unsigned) n_out, N, 0, st>>>(x, w, y, (int) n_in); \
+    else if (f == WForm::F16) bf16_f32_mmvf_kernel<N, 1><<<(unsigned) n_out, N, 0, st>>>(x, w, y, (int) n_in); \
+    else bf16_f32_mmvf_kernel<N, 2><<<(unsigned) n_out, N, 0, st>>>(x, w, y, (int) n_in); \
+    break
     switch (mmvf_block_size(n_in)) {
         STRATA_MMVF_CASE(32);
         STRATA_MMVF_CASE(64);

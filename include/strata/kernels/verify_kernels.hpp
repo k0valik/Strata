@@ -14,6 +14,8 @@
 // Everything that varies per window (token ids, `n_keep`) is read from DEVICE memory so the kernels can be captured.
 #pragma once
 
+#include "strata/kernels/bf16_gemv.hpp"
+
 #include <cstdint>
 
 namespace strata::kernels {
@@ -28,6 +30,7 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
 /// history <- the last 3 entries of [history | qkv_0 .. qkv_{n-1}], n = *n_keep (0 leaves it as it was).
 void gdn_conv_commit(float* history, const float* qkv, int channels, const int32_t* n_keep, void* stream);
 /// alpha/beta for T columns of x (T, n_embd): gate (T, h_v), beta (T, h_v).  Bitwise `fused_gdn_ab` per column.
+<<<<<<< this fork
 /// gdn_conv_l2_multi and gdn_ab_multi in one launch (143-amdk)
 void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
                        float eps, int n_tok, int t_begin, bool commit, const float* x, const uint16_t* w_alpha,
@@ -35,6 +38,11 @@ void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv
                        int h_v, void* stream);
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream);
+=======
+/// `form`: the weights' stored form (STRATA_FP16=load: F32 gates, or FP16); Bf16 is the original kernel's bits.
+void gdn_ab_multi(const float* x, const void* w_alpha, const void* w_beta, const float* dt, const float* ssm_a,
+                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream, WForm form = WForm::Bf16);
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
 /// The recurrence + output norm for T tokens (h = (T, conv_channels) as q|k|v, gate/beta (T, h_v), z/y
 /// (T, value_dim)).  With `n_keep == nullptr` the state is read and NOT written (verify); otherwise the first
 /// *n_keep tokens are run and the state is written (commit; `y` may be scratch).  Bitwise `fused_gdn_step_norm`.
@@ -103,6 +111,27 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream);
 /// ptr[k] = base + k * blob_bytes for k < *n (the staged copies `fetch_blobs` made).
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream);
+/// fetch_blobs for the blobs q = q0, q0 + qstep, ... below *n only (the rest come from a partner GPU).
+void fetch_blobs_strided(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int q0,
+                         int qstep, void* stream);
+/// Spin until *flag (mapped host memory) is non-zero, then clear it: the partner GPU's share of a layer has landed.
+void wait_and_clear(uint32_t* flag, void* stream);
+/// The partner GPU's share of a verify window's PCIe experts (a layer split's idle NVLink peer).  Step k (ring k+1):
+/// wait for the plan (flagA >= k+1, mapped), copy the plan's odd PCIe blobs (q = 1, 3, ...) from host memory into the
+/// active GPU's staging (peer writes over NVLink), then the last block sets done[k] (mapped).  flagA = UINT32_MAX
+/// (release_gpu_waits) ends it.
+struct PartnerFetchArgs {
+    const uint32_t* flagA;          // mapped, portable
+    const int32_t* plan;            // the mapped plan, group g at plan + g * plan_i32
+    long long plan_i32, ptr_off, capx;
+    int G, steps, lb;
+    const long long* blob_bytes;    // per layer, on the partner GPU
+    uint8_t* staging;               // the active GPU's staging (peer)
+    long long per, max_blob;        // staging blobs per group, slot size
+    uint32_t* done;                 // mapped, one per step
+    unsigned* arrive;               // on the partner GPU, one per step, zeroed per window
+};
+void partner_fetch(const PartnerFetchArgs& a, int blocks, void* stream);
 
 // ---- the MTP draft layer (src/core/mtp.cpp)
 /// R[t][c][:] = h[t][c][:] + e[t][:]  (the embedding branch added to every stream).

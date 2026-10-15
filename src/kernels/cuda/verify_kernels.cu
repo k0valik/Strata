@@ -90,6 +90,7 @@ __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __
     hist[c * 3 + 2] = seq[2];
 }
 
+<<<<<<< this fork
 template <int MAX_T = kVerifyMaxT, bool EXACT_T = false>
 __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restrict__ x, const uint16_t* __restrict__ wa,
                                                           const uint16_t* __restrict__ wb,
@@ -97,36 +98,60 @@ __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restric
                                                           const float* __restrict__ ssm_a, float* __restrict__ gate,
                                                           float* __restrict__ beta, int n, int h_v, int T) {
     const int row = bx * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+=======
+// 8 weights of row `base` (16-byte chunk j of a 16-bit row; 32 bytes of an F32 one), widened to FP32
+template <int WF>
+__device__ __forceinline__ void wload8(const void* base, int j, float* w) {
+    if constexpr (WF == 2) {
+        const float4* p = reinterpret_cast<const float4*>(base) + 2 * j;
+        const float4 a = __ldg(p), b = __ldg(p + 1);
+        w[0] = a.x; w[1] = a.y; w[2] = a.z; w[3] = a.w; w[4] = b.x; w[5] = b.y; w[6] = b.z; w[7] = b.w;
+    } else {
+        const uint4 v = __ldg(reinterpret_cast<const uint4*>(base) + j);
+        const uint32_t u[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            if constexpr (WF == 0) { w[2 * k] = __uint_as_float(u[k] << 16); w[2 * k + 1] = __uint_as_float(u[k] & 0xffff0000u); }
+            else { w[2 * k] = __half2float(__ushort_as_half((uint16_t) u[k])); w[2 * k + 1] = __half2float(__ushort_as_half((uint16_t) (u[k] >> 16))); }
+        }
+    }
+}
+
+template <int WF>
+__global__ void __launch_bounds__(256) gdn_ab_multi_kernel(const float* __restrict__ x, const void* __restrict__ wa,
+                                                           const void* __restrict__ wb,
+                                                           const float* __restrict__ dt,
+                                                           const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                                           float* __restrict__ beta, int n, int h_v, int T) {
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
     if (row >= 2 * h_v) return;
     const bool is_beta = row >= h_v;
     const int r = is_beta ? row - h_v : row;
-    const uint4* w4 = reinterpret_cast<const uint4*>((is_beta ? wb : wa) + (size_t) r * n);
-    float acc[MAX_T];
+    const void* wrow = reinterpret_cast<const char*>(is_beta ? wb : wa) + (size_t) r * n * (WF == 2 ? 4 : 2);
+    float acc[kVerifyMaxT];
 #pragma unroll
-    for (int t = 0; t < MAX_T; ++t) acc[t] = 0.0f;
+    for (int t = 0; t < kVerifyMaxT; ++t) acc[t] = 0.0f;
     for (int j = lane; j < n / 8; j += 32) {
-        const uint4 wv = __ldg(w4 + j);
-        const float w0 = __uint_as_float(wv.x << 16), w1 = __uint_as_float(wv.x & 0xffff0000u);
-        const float w2 = __uint_as_float(wv.y << 16), w3 = __uint_as_float(wv.y & 0xffff0000u);
-        const float w4f = __uint_as_float(wv.z << 16), w5 = __uint_as_float(wv.z & 0xffff0000u);
-        const float w6 = __uint_as_float(wv.w << 16), w7 = __uint_as_float(wv.w & 0xffff0000u);
+        float w[8];
+        wload8<WF>(wrow, j, w);
 #pragma unroll
-        for (int t = 0; t < MAX_T; ++t) {
-            if (!EXACT_T && t >= T) break;
+        for (int t = 0; t < kVerifyMaxT; ++t) {
+            if (t >= T) break;
             const float* xt = x + (size_t) t * n;
             const float4 xa = __ldg(reinterpret_cast<const float4*>(xt + j * 8));
             const float4 xb = __ldg(reinterpret_cast<const float4*>(xt + j * 8 + 4));
             float a = acc[t];
-            a = fmaf(w0, xa.x, a); a = fmaf(w1, xa.y, a);
-            a = fmaf(w2, xa.z, a); a = fmaf(w3, xa.w, a);
-            a = fmaf(w4f, xb.x, a); a = fmaf(w5, xb.y, a);
-            a = fmaf(w6, xb.z, a); a = fmaf(w7, xb.w, a);
+            a = fmaf(w[0], xa.x, a); a = fmaf(w[1], xa.y, a);
+            a = fmaf(w[2], xa.z, a); a = fmaf(w[3], xa.w, a);
+            a = fmaf(w[4], xb.x, a); a = fmaf(w[5], xb.y, a);
+            a = fmaf(w[6], xb.z, a); a = fmaf(w[7], xb.w, a);
             acc[t] = a;
         }
     }
 #pragma unroll
-    for (int t = 0; t < MAX_T; ++t) {
-        if (!EXACT_T && t >= T) break;
+    for (int t = 0; t < kVerifyMaxT; ++t) {
+        if (t >= T) break;
         float a = acc[t];
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
@@ -141,6 +166,7 @@ __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restric
     }
 }
 
+<<<<<<< this fork
 template <int MAX_T = kVerifyMaxT, bool EXACT_T = false>
 __global__ void __launch_bounds__(64) gdn_ab_multi_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
                                                           const uint16_t* __restrict__ wb,
@@ -165,6 +191,54 @@ __global__ void __launch_bounds__(S) gdn_conv_ab_kernel(int conv_blocks, float* 
         gdn_conv_l2_body((int) blockIdx.x - ab_blocks, (int) blockIdx.y, hist, qkv, w, h, C, qk_heads, eps, t_begin, commit);
     } else if (blockIdx.y == 0 && threadIdx.x < 64) {
         gdn_ab_body<MAX_T, EXACT_T>((int) blockIdx.x, x, wa, wb, dt, ssm_a, gate, beta, n, h_v, T);
+=======
+// gdn_ab_multi_kernel for TT tokens and n = 2560 (10 chunks per lane): the loops have fixed trip counts, so every
+// chunk's weight and activation loads can be issued up front; the same FMAs in the same order
+template <int WF, int TT>
+__global__ void __launch_bounds__(256) gdn_ab_multi_t_kernel(const float* __restrict__ x, const void* __restrict__ wa,
+                                                             const void* __restrict__ wb, const float* __restrict__ dt,
+                                                             const float* __restrict__ ssm_a, float* __restrict__ gate,
+                                                             float* __restrict__ beta, int h_v) {
+    constexpr int n = 2560, CH = n / 8 / 32;
+    const int row = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= 2 * h_v) return;
+    const bool is_beta = row >= h_v;
+    const int r = is_beta ? row - h_v : row;
+    const void* wrow = reinterpret_cast<const char*>(is_beta ? wb : wa) + (size_t) r * n * (WF == 2 ? 4 : 2);
+    float acc[TT];
+#pragma unroll
+    for (int t = 0; t < TT; ++t) acc[t] = 0.0f;
+#pragma unroll
+    for (int it = 0; it < CH; ++it) {
+        const int j = lane + 32 * it;
+        float w[8];
+        wload8<WF>(wrow, j, w);
+#pragma unroll
+        for (int t = 0; t < TT; ++t) {
+            const float* xt = x + (size_t) t * n;
+            const float4 xa = *reinterpret_cast<const float4*>(xt + j * 8);
+            const float4 xb = *reinterpret_cast<const float4*>(xt + j * 8 + 4);
+            float a = acc[t];
+            a = fmaf(w[0], xa.x, a); a = fmaf(w[1], xa.y, a);
+            a = fmaf(w[2], xa.z, a); a = fmaf(w[3], xa.w, a);
+            a = fmaf(w[4], xb.x, a); a = fmaf(w[5], xb.y, a);
+            a = fmaf(w[6], xb.z, a); a = fmaf(w[7], xb.w, a);
+            acc[t] = a;
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < TT; ++t) {
+        float a = acc[t];
+        for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
+        if (lane != 0) continue;
+        if (is_beta) {
+            beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
+        } else {
+            const float v = a + dt[r];
+            const float sp = v > 20.0f ? v : log1pf(__expf(v));
+            gate[(size_t) t * h_v + r] = sp * ssm_a[r];
+        }
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
     }
 }
 
@@ -579,11 +653,103 @@ __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __rest
 
 __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
                                    uint4* __restrict__ dst, long long per) {
+    // four independent 16-byte loads in flight per thread before their stores: the link's latency is covered with
+    // fewer blocks, which leaves SMs to the VRAM experts running beside this copy (STRATA_FETCH_BLOCKS)
     const long long total = (long long) *n * per;
-    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
-         i += (long long) gridDim.x * blockDim.x) {
-        const long long k = i / per, off = i - k * per;
-        dst[i] = ((const uint4*) src[k])[off];
+    const long long S = (long long) gridDim.x * blockDim.x;
+    long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    for (; i + 3 * S < total; i += 4 * S) {
+        uint4 v[4];
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const long long j = i + u * S, k = j / per;
+            v[u] = ((const uint4*) src[k])[j - k * per];
+        }
+#pragma unroll
+        for (int u = 0; u < 4; ++u) dst[i + u * S] = v[u];
+    }
+    for (; i < total; i += S) {
+        const long long k = i / per;
+        dst[i] = ((const uint4*) src[k])[i - k * per];
+    }
+}
+
+__global__ void fetch_blobs_strided_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                           uint8_t* __restrict__ dst, long long per, int q0, int qstep) {
+    const int nq = *n > q0 ? (*n - q0 + qstep - 1) / qstep : 0;
+    const long long total = (long long) nq * per;
+    const long long S = (long long) gridDim.x * blockDim.x;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += S) {
+        const long long j = i / per, off = i - j * per;
+        const int q = q0 + (int) j * qstep;
+        ((uint4*) (dst + (size_t) q * (size_t) per * 16))[off] = ((const uint4*) src[q])[off];
+    }
+}
+
+__global__ void wait_and_clear_kernel(uint32_t* flag) {
+    volatile uint32_t* f = flag;
+    while (*f == 0) __nanosleep(100);
+    __threadfence_system();
+    *f = 0;
+}
+
+__global__ void partner_fetch_kernel(PartnerFetchArgs a) {
+    __shared__ unsigned long long sp[32];
+    __shared__ int s_n;
+    __shared__ int s_stop;
+    for (int k = 0; k < a.steps; ++k) {
+        const uint32_t ring = (uint32_t) k + 1;
+        if (threadIdx.x == 0) {
+            volatile const uint32_t* f = a.flagA;
+            uint32_t v;
+            while ((v = *f) < ring) __nanosleep(200);
+            s_stop = v == 0xffffffffu;
+            __threadfence_system();
+        }
+        __syncthreads();
+        if (s_stop) return;
+        const int grp = k % a.G, l = a.lb + k / a.G;
+        const volatile int32_t* pl = a.plan + (size_t) grp * (size_t) a.plan_i32;
+        if (threadIdx.x == 0) s_n = pl[2];
+        __syncthreads();
+        const int n2 = s_n < 32 ? s_n : 32;
+        const volatile unsigned long long* p2 = (const volatile unsigned long long*) (pl + a.ptr_off) + a.capx;
+        if ((int) threadIdx.x < n2) sp[threadIdx.x] = p2[threadIdx.x];
+        __syncthreads();
+        const long long per16 = a.blob_bytes[l] / 16;
+        uint8_t* stage = a.staging + (size_t) (grp * a.per) * (size_t) a.max_blob;
+        const int nodd = n2 / 2;   // q = 1, 3, ... < n2
+        const long long total = (long long) nodd * per16;
+        const long long S = (long long) gridDim.x * blockDim.x;
+        long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+        for (; i + 3 * S < total; i += 4 * S) {
+            uint4 v[4];
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const long long x = i + u * S, j = x / per16;
+                v[u] = ((const uint4*) sp[2 * j + 1])[x - j * per16];
+            }
+#pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const long long x = i + u * S, j = x / per16;
+                ((uint4*) (stage + (size_t) (2 * j + 1) * (size_t) a.blob_bytes[l]))[x - j * per16] = v[u];
+            }
+        }
+        for (; i < total; i += S) {
+            const long long j = i / per16;
+            ((uint4*) (stage + (size_t) (2 * j + 1) * (size_t) a.blob_bytes[l]))[i - j * per16] =
+                ((const uint4*) sp[2 * j + 1])[i - j * per16];
+        }
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const unsigned prev = atomicAdd(&a.arrive[k], 1u);
+            if (prev == gridDim.x - 1) {
+                __threadfence_system();
+                *(volatile uint32_t*) (a.done + k) = 1u;
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -678,8 +844,35 @@ __global__ void force_token_kernel(int32_t* tok, const int32_t* force, int j) {
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     if (cap <= 0) return;
     if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
-    fetch_blobs_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
+    static const unsigned blocks = [] {
+        const char* v = std::getenv("STRATA_FETCH_BLOCKS");
+        const int x = v ? std::atoi(v) : 0;
+        return x > 0 && x <= 4096 ? (unsigned) x : 24u;   // 24 x 256 beside the VRAM experts (AC922, 2 GPUs: 43.7 ms/window vs 45.8)
+    }();
+    static const unsigned threads = [] {
+        const char* v = std::getenv("STRATA_FETCH_THREADS");
+        const int x = v ? std::atoi(v) : 0;
+        return x == 512 || x == 1024 ? (unsigned) x : 256u;
+    }();
+    fetch_blobs_kernel<<<blocks, threads, 0, (cudaStream_t) stream>>>(src, n, (uint4*) dst, (long long) (blob_bytes / 16));
     check("fetch_blobs");
+}
+
+void fetch_blobs_strided(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int q0,
+                         int qstep, void* stream) {
+    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs: blob size must be a multiple of 16\n"); std::exit(1); }
+    fetch_blobs_strided_kernel<<<24, 256, 0, (cudaStream_t) stream>>>(src, n, dst, (long long) (blob_bytes / 16), q0, qstep);
+    check("fetch_blobs_strided");
+}
+
+void wait_and_clear(uint32_t* flag, void* stream) {
+    wait_and_clear_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag);
+    check("wait_and_clear");
+}
+
+void partner_fetch(const PartnerFetchArgs& a, int blocks, void* stream) {
+    partner_fetch_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(a);
+    check("partner_fetch");
 }
 
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
@@ -1016,6 +1209,7 @@ void gdn_conv_commit(float* history, const float* qkv, int channels, const int32
     check("gdn_conv_commit");
 }
 
+<<<<<<< this fork
 bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv, int64_t qkv_stride,
                        const float* h, int64_t h_stride, const float* gate, const float* beta, int64_t gb_stride,
                        int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream) {
@@ -1041,21 +1235,32 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
 
 void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
                   float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
+=======
+void gdn_ab_multi(const float* x, const void* w_alpha, const void* w_beta, const float* dt, const float* ssm_a,
+                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream, WForm form) {
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
     if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) {
         std::fprintf(stderr, "gdn_ab_multi: invalid arguments\n");
         std::exit(1);
     }
-    const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
-    cudaStream_t st = (cudaStream_t) stream;
-    switch (n_tok) {
-        case 1: gdn_ab_multi_kernel<1, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
-        case 2: gdn_ab_multi_kernel<2, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
-        case 3: gdn_ab_multi_kernel<3, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
-        case 4: gdn_ab_multi_kernel<4, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
-        case 5: gdn_ab_multi_kernel<5, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
-        case 6: gdn_ab_multi_kernel<6, true><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
-        default: gdn_ab_multi_kernel<kVerifyMaxT, false><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+    const unsigned blocks = (unsigned) ((2 * h_v + 7) / 8);
+    static const bool generic = [] { const char* v = std::getenv("STRATA_HC_DOWN_GENERIC"); return v && v[0] == '1'; }();
+    if (n_embd == 2560 && !generic) {
+        const cudaStream_t st = (cudaStream_t) stream;
+#define STRATA_AB_T(TT) case TT: \
+        if (form == WForm::Bf16) gdn_ab_multi_t_kernel<0, TT><<<blocks, 256, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, h_v); \
+        else if (form == WForm::F16) gdn_ab_multi_t_kernel<1, TT><<<blocks, 256, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, h_v); \
+        else gdn_ab_multi_t_kernel<2, TT><<<blocks, 256, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, h_v); \
+        check("gdn_ab_multi"); return;
+        switch (n_tok) { STRATA_AB_T(1) STRATA_AB_T(2) STRATA_AB_T(3) STRATA_AB_T(4) STRATA_AB_T(5) STRATA_AB_T(6) STRATA_AB_T(7) STRATA_AB_T(8) default: break; }
+#undef STRATA_AB_T
     }
+    if (form == WForm::Bf16)
+        gdn_ab_multi_kernel<0><<<blocks, 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    else if (form == WForm::F16)
+        gdn_ab_multi_kernel<1><<<blocks, 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+    else
+        gdn_ab_multi_kernel<2><<<blocks, 256, 0, (cudaStream_t) stream>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     check("gdn_ab_multi");
 }
 

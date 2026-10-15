@@ -175,6 +175,7 @@ __global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_b
     group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * ld + gi * 32);
 }
 
+<<<<<<< this fork
 // ---- the wide kernels: a thread per 8 values (Pascal, sm_61) --------------------------------------------------------
 // dequant_kernel's thread reads its 32-value group a byte at a time and writes 32 two-byte values one by one, 64 bytes
 // from its neighbour's.  On a Tesla P40 (sm_61) that is 7.2 ms for a 10240 x 2560 Q6_K weight (10 GB/s), and the IQ3_S
@@ -281,6 +282,8 @@ bool dequant_wide_on() {
     return per_dev[dev] == 2;
 }
 
+=======
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
 // Q8_0 with four threads per block, 8 values each: the warp reads 8 consecutive blocks and writes 512 consecutive
 // bytes (a thread per block wrote 2-byte values 64 bytes apart: ~110 GB/s, a quarter of a prompt projection's time)
 template <typename T>
@@ -343,6 +346,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
+<<<<<<< this fork
     // the wide kernels: even block addresses, 16-byte stores at every row (contiguous or a stride of whole stores)
     if (wide_type(type) && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 && (reinterpret_cast<uintptr_t>(out) & 15) == 0 &&
         ((size_t) ld * sizeof(T)) % 16 == 0 && 4 * total < (1ll << 31) && dequant_wide_on()) {
@@ -359,6 +363,8 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
+=======
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
 #define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out); break
     switch (type) {
     case 2: STRATA_DQ(2);

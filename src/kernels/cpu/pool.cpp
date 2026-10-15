@@ -8,10 +8,15 @@
 #include <atomic>
 #include <cmath>
 #include <chrono>
+<<<<<<< this fork
 #include <immintrin.h>
 #if defined(_MSC_VER)
 #include <intrin.h>   // __cpuidex, __rdtsc (STRATA_POOL_UMWAIT)
 #endif
+=======
+#include "strata/platform/cpu_relax.hpp"
+#include "strata/platform/thread_affinity.hpp"
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
 
 #include <cstdio>
 #include <cstdlib>
@@ -338,7 +343,16 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
                              [&](const CoreLinux& x, const CoreLinux& y) {
                                  return is_e(x) != is_e(y) ? !is_e(x) : x.cap > y.cap;
                              });
-        for (const auto& cl : all_cpus) {
+        // STRATA_POOL_SMT=k (opt-in): k hardware threads of each physical core, core by core (POWER9: a core's
+        // two halves each run one thread at full speed, measured 1.95x a core's expert throughput at k = 2)
+        static const int smt = [] { const char* e = std::getenv("STRATA_POOL_SMT"); return e ? (std::max)(1, std::atoi(e)) : 1; }();
+        if (smt > 1) {
+            for (const auto& key : seen_phys) {
+                int taken = 0;
+                for (const auto& cl : all_cpus)
+                    if (cl.pkg == key.first && cl.core == key.second && taken < smt) { topo.worker_cores.push_back(cl.cpu); ++taken; }
+            }
+        } else for (const auto& cl : all_cpus) {
             if (!cl.is_sibling) topo.worker_cores.push_back(cl.cpu);
         }
         if (skip_first && !topo.worker_cores.empty()) {
@@ -420,6 +434,12 @@ ThreadAffinity pin_current_thread(int core) {
         return {};
     }
     previous.valid = true;
+    {   // the threads this one creates take the previous set back (platform::release_inherited_pin)
+        cpu_set_t prev;
+        CPU_ZERO(&prev);
+        std::memcpy(&prev, previous.mask.data(), std::min(sizeof prev, previous.mask.size() * sizeof(unsigned long)));
+        strata::platform::note_host_pin(prev, core);
+    }
     return previous;
 #endif
 }
@@ -554,6 +574,7 @@ void ExpertPool::worker(int id) {
 #endif
         while (epoch_.load(std::memory_order_acquire) == seen) {
             if (stop_.load(std::memory_order_relaxed)) return;
+<<<<<<< this fork
 #if defined(_MSC_VER) && defined(_M_X64) && !defined(__clang__)   // MSVC proper: clang-cl (the Windows HIP build) has no WAITPKG intrinsics by default
             if (um != 0) {   // STRATA_POOL_UMWAIT: wake on the publish's write to epoch_, or after `um` cycles
                 _umonitor((void*) &epoch_);
@@ -568,6 +589,10 @@ void ExpertPool::worker(int id) {
                 _mm_pause();
                 if ((++spins & 1023u) != 0) continue;
             }
+=======
+            strata_cpu_pause();
+            if ((++spins & 1023u) != 0) continue;
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
@@ -624,7 +649,7 @@ void ExpertPool::wait_parked(const char* what) {
     uint32_t spins = 0;
     std::chrono::steady_clock::time_point t0{};
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) {
-        _mm_pause();
+        strata_cpu_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u) t0 = now;
@@ -647,7 +672,7 @@ void ExpertPool::wait_done(int n) {
     for (;;) {
         const uint32_t d = done_.load(std::memory_order_acquire);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
-        _mm_pause();
+        strata_cpu_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock

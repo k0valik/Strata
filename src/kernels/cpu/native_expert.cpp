@@ -7,8 +7,12 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx1.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
+<<<<<<< this fork
 #include "strata/kernels/cpu/nvfp4_avx2.hpp"
 #include "strata/kernels/cpu/nvfp4_avx512.hpp"
+=======
+#include "strata/kernels/cpu/kq_vsx.hpp"
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include "ggml.h"
@@ -37,6 +41,7 @@ bool native_experts_available() noexcept { return true; }
 // compiled for AVX-512 and iq_avx2.cpp / kq_avx2.cpp for AVX2, and native_gu_rows asks these on every CPU before it
 // has checked what the CPU can run.  A function in a wide-ISA file may use that ISA anywhere in its body, so an
 // answer that is only a comparison must not come from one (#795).
+#if defined(__x86_64__) || defined(_M_X64)   // ac922: elsewhere portable.cpp answers (none of these kernels exist)
 bool iq512_supported(int type) noexcept {
     return type == 16 || type == 17 || type == 18 || type == 21 || type == 22;
 }
@@ -46,6 +51,7 @@ bool iq256_supported(int type) noexcept {
 }
 
 bool kq256_supported(int type) noexcept { return type == 12 || type == 7 || type == 8; }
+#endif
 
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     init_once();
@@ -169,6 +175,11 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::atoi(v) != 0; }();
+    // POWER9 (STRATA_VSX_EXPERTS=1): Q4_K gate/up through the VSX multi-token kernel, any group size
+    if (f.gu_type == 12 && f.gu_act == 15 && kq_vsx_on()) {
+        kq_vsx_gu_rows(blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
+        return;
+    }
     if (kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
@@ -234,9 +245,17 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
                       int r0, int r1) {
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.
+#if defined(__x86_64__) || defined(_M_X64)
     static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
+#else
+    static const bool iq4nl_mt = false;   // the multi-token kernel is AVX-2 (portable.cpp has none)
+#endif
     static const int mt_min = [] { const char* e = std::getenv("STRATA_IQ_MT_MIN"); return e ? std::atoi(e) : 2; }();
     static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::atoi(v) != 0; }();
+    if (f.d_type == 7 && f.d_act == 9 && f.n_ff % 128 == 0 && f.n_ff <= 1024 && kq_vsx_on()) {   // POWER9: Q5_1 down
+        kq_vsx_q51_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
+        return;
+    }
     // Both multi-token kernels below are /arch:AVX2 translation units (kq_avx2.cpp and iq_avx2.cpp),
     // so a CPU without AVX2 has to reach ggml-cpu's vec_dot instead - same reasoning as the gate/up
     // rows above, where `avx512` tested cpu_avx512_ok() and `avx2` did not.

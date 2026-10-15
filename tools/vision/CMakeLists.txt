@@ -41,6 +41,8 @@ if(STRATA_PORTABLE)
     set(${_f} OFF CACHE BOOL "" FORCE)
   endforeach()
   message(STATUS "strata-vision: portable build (AVX2 baseline, runs on other PCs)")
+elseif(GGML_CPU_ARM_ARCH)   # aarch64 with explicit flags (setup's arm_cpu_arch): -mcpu=native finds none on GB10
+  set(GGML_NATIVE OFF CACHE BOOL "" FORCE)
 else()
   # this PC's instruction set; a build folder that was portable before gets a fresh native build's settings back
   set(GGML_NATIVE ON CACHE BOOL "" FORCE)

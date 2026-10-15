@@ -1,4 +1,7 @@
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
+#include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/f16_bits.hpp"
+#include "strata/core/fp16_mode.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/spec_prob.hpp"
@@ -12,6 +15,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -154,6 +158,7 @@ MtpDrafter::~MtpDrafter() {
     if (sh_join_) cudaEventDestroy(sh_join_);
     if (owns_weights_ && dense_) cudaFree(dense_);
     if (owns_weights_ && experts_) cudaFree(experts_);
+    if (owns_weights_ && f16_) cudaFree(f16_);
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
@@ -246,6 +251,11 @@ bool MtpDrafter::make_q4_head(std::string& err) {
 #endif
 }
 
+const uint16_t* MtpDrafter::tensor_f16(const char* name) const {
+    for (const auto& [n, off] : f16_off_) if (n == name) return f16_ + off;
+    return nullptr;
+}
+
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
                       int64_t window, const MtpDrafter* shared) {
 #if defined(STRATA_GPU_METAL)
@@ -271,6 +281,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         dense_ = shared->dense_;
         experts_ = shared->experts_;
         tensors_ = shared->tensors_;
+        // ac922: the native-layout experts' types and size (STRATA_MTP_EXPERTS) and the FP16 copies (STRATA_FP16_MTP)
+        xgu_ = shared->xgu_; xd_ = shared->xd_; xblob_ = shared->xblob_;
+        f16_ = shared->f16_; f16_off_ = shared->f16_off_;
         owns_weights_ = false;
         owns_draft_head_ = false;
     }
@@ -305,13 +318,80 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         vram_ += blob.size();
         if (q4_ && !make_q4_dense(blob, err)) return false;
     }
+    // ---- STRATA_FP16_MTP=1: FP16 copies of the BF16 weights the prompt path's GEMMs read (exact: BF16 values in
+    //      FP16's range; the count of values that became FP16 subnormals or zero is reported)
+    if (strata::fp16_mtp() && shared == nullptr) {   // a slot drafter borrows the owner's copies (above)
+        static const char* names[] = {"attn_hyper_connection.input_mix_weight_down.weight",
+                                      "attn_hyper_connection.input_mix_weight_up.weight"};
+        std::vector<uint8_t> blob;
+        if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
+        std::vector<uint16_t> host;
+        uint64_t sub = 0, zero = 0, over = 0;
+        for (const char* n : names) {
+            const Tensor* t = nullptr;
+            for (const auto& x : tensors_) if (x.name == n) t = &x;
+            if (t == nullptr || t->kind != "bf16") { err = std::string("mtp: STRATA_FP16_MTP=1: ") + n + " is not BF16"; return false; }
+            f16_off_.emplace_back(n, host.size());
+            const uint16_t* src = reinterpret_cast<const uint16_t*>(blob.data() + t->off);
+            for (uint64_t i = 0; i < t->bytes / 2; ++i) {
+                const float x = strata::kernels::f32_from_bf16(src[i]);
+                const uint16_t h = strata::kernels::f16_from_f32(x);
+                if (std::fabs(x) > 65504.0f) ++over;
+                else if (x != 0.0f && (h & 0x7fffu) == 0) ++zero;
+                else if (x != 0.0f && (h & 0x7c00u) == 0) ++sub;
+                host.push_back(h);
+            }
+        }
+        if (over) { err = "mtp: STRATA_FP16_MTP=1: " + std::to_string((unsigned long long) over) + " values beyond FP16's range"; return false; }
+        if (cudaMalloc((void**) &f16_, host.size() * 2) != cudaSuccess ||
+            cudaMemcpy(f16_, host.data(), host.size() * 2, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = "mtp: STRATA_FP16_MTP=1: the FP16 copies do not fit in VRAM";
+            return false;
+        }
+        vram_ += host.size() * 2;
+        std::fprintf(stderr, "strata mtp: STRATA_FP16_MTP=1: the prompt path's 2 hyper-connection weights as FP16 (%.1f MiB; "
+                             "%llu values became FP16 subnormals, %llu zero)\n", (double) host.size() * 2 / 1048576.0,
+                     (unsigned long long) sub, (unsigned long long) zero);
+    }
     // ---- the 512 routed experts, one blob each
     if (shared == nullptr) {
-        const uint64_t bytes = (uint64_t) g.n_expert * strata::kernels::cpu::BLOB;
+        // STRATA_MTP_EXPERTS=<file>: the experts from an MTP GGUF in the native layout (tools: mtp_experts.py), run by
+        // the main model's grouped native kernels instead of the pack's Q2_0 blobs
+        uint64_t blob = strata::kernels::cpu::BLOB;
+        std::string xpath = rt_dir + "/experts.bin";
+        long skip = 0;
+        if (const char* xp = std::getenv("STRATA_MTP_EXPERTS"); xp != nullptr && *xp) {
+            FILE* h = std::fopen(xp, "rb");
+            char magic[8] = {};
+            int32_t types[2] = {-1, -1};
+            const bool hdr = h != nullptr && std::fread(magic, 1, 8, h) == 8 && std::fread(types, 4, 2, h) == 2 &&
+                             std::memcmp(magic, "SMTPEXP1", 8) == 0;
+            long size = -1;
+            if (h != nullptr) { std::fseek(h, 0, SEEK_END); size = std::ftell(h); std::fclose(h); }
+            if (!hdr) { err = std::string("mtp: STRATA_MTP_EXPERTS=") + xp + " is not an SMTPEXP1 file"; return false; }
+            if (!strata::kernels::native_expert_supported(types[0], types[1], g.n_embd, g.n_ff)) {
+                err = "mtp: STRATA_MTP_EXPERTS: no native kernels for gate/up type " + std::to_string(types[0]) +
+                      ", down type " + std::to_string(types[1]);
+                return false;
+            }
+            const strata::kernels::NativeExpertLayout L =
+                strata::kernels::native_expert_layout(types[0], types[1], g.n_embd, g.n_ff);
+            if (size != (long) (16 + (uint64_t) g.n_expert * L.bytes)) {
+                err = std::string("mtp: STRATA_MTP_EXPERTS=") + xp + " has " + std::to_string(size) + " bytes, not " +
+                      std::to_string(16 + (uint64_t) g.n_expert * L.bytes);
+                return false;
+            }
+            blob = L.bytes; xpath = xp; skip = 16; xgu_ = types[0]; xd_ = types[1];
+            std::fprintf(stderr, "strata mtp: experts from %s (gate/up type %d, down type %d, %.2f GiB), native kernels\n",
+                         xp, xgu_, xd_, (double) g.n_expert * blob / 1073741824.0);
+        }
+        xblob_ = blob;
+        const uint64_t bytes = (uint64_t) g.n_expert * blob;
         // Loader fix (0.1.15+loaderfix.2): each 64 MiB read below reached the disk as ~16k 4095-byte reads under
         // MSVC's `basic_filebuf::xsgetn`, which is what made 675 MiB of drafter experts take minutes.
-        FILE* f = std::fopen((rt_dir + "/experts.bin").c_str(), "rb");
-        if (f == nullptr) { err = "mtp: cannot open experts.bin"; return false; }
+        FILE* f = std::fopen(xpath.c_str(), "rb");
+        if (f == nullptr) { err = "mtp: cannot open " + xpath; return false; }
+        if (skip > 0) std::fseek(f, skip, SEEK_SET);
         struct Closer {
             FILE* f;
             ~Closer() { if (f != nullptr) std::fclose(f); }
@@ -395,7 +475,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
-        attn_scratch_ = b.take<float>((uint64_t) attn_scratch_floats_);   // the full layer runs one row at a time
+        attn_scratch_ = b.take<float>((uint64_t) attn_scratch_floats_ * T);   // the batch call uses one stride per row
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); y_ = b.take<float>(T * N);
         sample_ = b.take<float>(T * N);
@@ -407,8 +487,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
         grp_ptr_ = b.take<unsigned long long>(T * K); grp_start_ = b.take<int32_t>(T * K + 1);
         grp_counts_ = b.take<int32_t>(4);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        hit_scratch_ = b.take<uint8_t>(strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff));
+        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 36); hit_xs_ = b.take<float>(T * (N / 32));   // 36: Q8_1 (native)
+        hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
+            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
+            xgu_ >= 0 ? strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff) : 0));
         sh_scratch_ = (float*) b.take<uint8_t>(strata::kernels::shared_expert_scratch_bytes(g.n_ff));
         x_bf16_ = b.take<uint16_t>(N);
         out_ids_ = b.take<int32_t>(T + 4);
@@ -494,9 +576,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                      (double) vram_ / 1048576.0);
     } else {
         std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
-                     (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
+                     (double) vram_ / 1048576.0, (double) g.n_expert * xblob_ / 1048576.0,
                      (double) tensors_.back().off / 1048576.0, files_s,
-                     files_s > 0 ? ((double) g.n_expert * strata::kernels::cpu::BLOB + (double) tensors_.back().off) /
+                     files_s > 0 ? ((double) g.n_expert * xblob_ + (double) tensors_.back().off) /
                                        1048576.0 / files_s : 0.0);
     }
     return true;
@@ -1113,6 +1195,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
         }
+<<<<<<< this fork
         if (rr_res_ != nullptr && rr_margin_ > 0.0f && g.n_expert == 512 && K == 10) {
             try {
                 native_route_resident(logits_, ids_, w_, rr_res_, T, rr_margin_, rr_lo_, rr_hi_, nullptr, cs);
@@ -1120,11 +1203,24 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }
         g_mp.stamp(9, cs);
         moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) strata::kernels::cpu::BLOB, grp_ptr_,
+=======
+        moe_group_resident(ids_, (int) (T * K), (int) K, experts_, (int64_t) xblob_, grp_ptr_,
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
                            grp_start_, grp_counts_, hit_dst_, hit_slot_, cs);
+        if (xgu_ >= 0) {   // STRATA_MTP_EXPERTS: the native layout, Q8_1 activations
+            const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(xgu_, xd_, g.n_embd, g.n_ff);
+            strata::kernels::quantize_q8_1_rows(mixed_, T, (int64_t) N, hit_xq_, cs);
+            strata::kernels::native_expert_grouped(L, grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K,
+                                                   (int64_t) T * K, hit_xq_, hit_scratch_, parts_, cs);
+        } else {
         quantize_q8_0_scaled(mixed_, hit_xq_, hit_xs_, (int64_t) T * N, cs);
         moe_grouped_s2(grp_ptr_, grp_start_, grp_counts_, hit_dst_, hit_slot_, (int64_t) T * K, (int64_t) T * K, hit_xq_,
                        hit_xs_, hit_scratch_, parts_, cs);
+<<<<<<< this fork
         g_mp.stamp(10, cs);
+=======
+        }
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
         if (branch_on) {
             if (cudaStreamWaitEvent(cs, sh_join_, 0) != cudaSuccess) { err = "mtp: the shared expert's join"; return false; }
         } else {

@@ -141,6 +141,7 @@ public:
 
 private:
     friend class NativeDense;
+    friend class LoadConverted;
     std::map<std::string, WeightRef> table_;
     LoadReport report_;
     std::string pack_dir_;
