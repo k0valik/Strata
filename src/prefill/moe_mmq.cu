@@ -11,8 +11,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+<<<<<<< this fork
 #include <cstring>
 #include <climits>
+=======
+#include <stdexcept>
+#include <vector>
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
 
 namespace strata::prefill::mmq {
 #if defined(STRATA_KQ_DSO)
@@ -122,13 +127,15 @@ __global__ void strata_q2_kernel(const uint8_t* __restrict__ blob, uint16_t* __r
 }
 
 __global__ void swiglu_kernel(const float* __restrict__ gu, float* __restrict__ h, int64_t rows, int64_t n_ff,
-                              bool interleaved) {
+                              bool interleaved, float limit) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= rows * n_ff) return;
     const int64_t r = i / n_ff, k = i % n_ff;
     const float* row = gu + r * 2 * n_ff;
-    const float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
-    h[i] = g / (1.0f + __expf(-g)) * u;
+    float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
+    float up = u;
+    if (limit > 0) { g = fminf(g, limit); up = fmaxf(-limit, fminf(up, limit)); }
+    h[i] = g / (1.0f + __expf(-g)) * up;
 }
 
 // swiglu_kernel on the MMQ gate/up output with each expert's gate and up scales applied as it is read: the products
@@ -200,6 +207,9 @@ Nvfp4Mode nvfp4_mode() {
 
 bool supported(int t) {
     switch ((ggml_type) t) {
+#ifdef STRATA_GLM_Q23_MMQ
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K:
+#endif
         case GGML_TYPE_Q2_0:
 #ifdef STRATA_ORCA_Q4KS_MMQ
         case GGML_TYPE_Q5_0:   // #296 (Q4_K and Q5_1: STRATA_MMQ_KQUANTS)
@@ -209,9 +219,15 @@ bool supported(int t) {
         case GGML_TYPE_Q8_0:   // the draft layer's dense matrices (E-9)
             return true;
 #ifdef STRATA_MMQ_KQUANTS
+<<<<<<< this fork
         // Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF projections (STRATA_DENSE_MMQ)
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1: case GGML_TYPE_Q6_K:
             return kq_ok();
+=======
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1:   // Unsloth's UD-Q4_K_XL experts (CUDA)
+#if defined(__HIPCC__) || defined(STRATA_Q6K_EXPERTS) || defined(STRATA_MMQ_KQUANTS)
+        case GGML_TYPE_Q6_K:   // HIP: the dense GGUF projections (STRATA_DENSE_MMQ); CUDA: -DSTRATA_Q6K_EXPERTS=ON or K-quant (Q4_K_M) experts
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
 #endif
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_NVFP4:
@@ -313,6 +329,7 @@ void scale_down_rows(float* d, int64_t ld, const int32_t* bounds, int n, const f
 void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols, int64_t ld, int64_t rows, void* stream,
               float* yscale) {
     if (rows <= 0) return;
+<<<<<<< this fork
 #if !defined(GGML_USE_HIP)
     if (fp4_activations(t)) {
         if (yscale == nullptr) { std::fprintf(stderr, "prefill mmq: NVFP4 activations need a scale buffer\n"); std::exit(1); }
@@ -323,6 +340,12 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
     }
 #endif
     (void) yscale;
+=======
+    if(t==GGML_TYPE_Q2_K||t==GGML_TYPE_Q3_K) {
+        const size_t used=(size_t)rows*pad512(cols)*sizeof(block_q8_1_mmq)/(4*QK8_1);
+        ck(cudaMemsetAsync(static_cast<char*>(xq)+used,0,q8_bytes(rows,cols)-used,(cudaStream_t)stream),"Q23 activation padding");
+    }
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
     quantize_mmq_q8_1_cuda(x, ids, xq, (ggml_type) t, cols, ld, rows * ld, rows * ld, pad512(cols), rows, 1, 1,
                            (cudaStream_t) stream);
     ck(cudaGetLastError(), "quantize");
@@ -332,6 +355,31 @@ Context::Context() {
     int dev = 0;
     cudaGetDevice(&dev);
     ctx_ = new ggml_backend_cuda_context(dev);
+}
+namespace {
+struct ExternalPool : ggml_cuda_pool {
+    struct Buffer { void* p; size_t bytes; bool used; };
+    char* data;
+    size_t capacity, cursor = 0;
+    std::vector<Buffer> buffers;
+    ExternalPool(void* p, size_t n) : data((char*)p), capacity(n) {}
+    void* alloc(size_t bytes, size_t* actual) override {
+        for (auto& b : buffers) if (!b.used && b.bytes >= bytes) { b.used = true; *actual = b.bytes; return b.p; }
+        bytes = (bytes + 255) / 256 * 256;
+        if (cursor + bytes > capacity) {
+            for (const auto& b : buffers) if (b.used) throw std::runtime_error("MMQ: external scratch exhausted");
+            buffers.clear(); cursor = 0;
+        }
+        if (bytes > capacity) throw std::runtime_error("MMQ: external scratch exhausted");
+        void* p = data + cursor; cursor += bytes;
+        buffers.push_back({p, bytes, true}); *actual = bytes; return p;
+    }
+    void free(void* p, size_t) override { for (auto& b : buffers) if (b.p == p) { b.used = false; return; } }
+};
+}
+Context::Context(void* scratch, size_t bytes) : Context() {
+    auto& context = *(ggml_backend_cuda_context*)ctx_;
+    context.pools[context.device][0] = std::make_unique<ExternalPool>(scratch, bytes);
 }
 Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
 
@@ -375,6 +423,7 @@ void Context::run(const Product& p, void* stream) {
 #ifdef STRATA_ORCA_Q4KS_MMQ
         case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0, GGML_PREC_Q8>(ctx, a, s); break;
 #endif
+<<<<<<< this fork
         case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0, GGML_PREC_Q8>(ctx, a, s); break;
         case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS, GGML_PREC_Q8>(ctx, a, s); break;
         case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS, GGML_PREC_Q8>(ctx, a, s); break;
@@ -404,6 +453,26 @@ void Context::run(const Product& p, void* stream) {
             if (fp4_activations(t)) run_nvfp4_w4a4(ctx, a, s);
             else run_nvfp4_w4a8(ctx, a, s);
             break;
+=======
+        case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
+#ifdef STRATA_GLM_Q23_MMQ
+        case GGML_TYPE_Q2_K: mul_mat_q_case<GGML_TYPE_Q2_K>(ctx, a, s); break;
+        case GGML_TYPE_Q3_K: mul_mat_q_case<GGML_TYPE_Q3_K>(ctx, a, s); break;
+#endif
+        case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
+        case GGML_TYPE_IQ3_XXS: mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, a, s); break;
+        case GGML_TYPE_IQ3_S: mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, a, s); break;
+        case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
+        case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
+        case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+#ifdef STRATA_MMQ_KQUANTS
+        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
+        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
+        case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
+        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
 #endif
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
@@ -465,6 +534,7 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
     ck(cudaGetLastError(), "gather_strata_q2");
 }
 
+<<<<<<< this fork
 void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const int32_t* bounds, int n,
                    const float* tails, int64_t row0, void* stream) {
     if (rows <= 0) return;
@@ -478,8 +548,11 @@ void down_row_scales(float* sd, const int32_t* bounds, int n, const float* tails
 }
 
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
+=======
+void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream, float limit) {
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
     if (rows <= 0) return;
-    swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved);
+    swiglu_kernel<<<blocks(rows * n_ff), 256, 0, (cudaStream_t) stream>>>(gu, h, rows, n_ff, interleaved, limit);
     ck(cudaGetLastError(), "swiglu");
 }
 
