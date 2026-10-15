@@ -1,21 +1,18 @@
 #include "strata/core/native_dense.hpp"
-#include <cstdlib>
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/native_mmvq.hpp"
-#include "strata/platform/memory.hpp"
 
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <climits>
-#include <cstdio>
-#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
 #include <set>
+<<<<<<< this fork
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -144,6 +141,14 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     // fallback.
     if (name == "blk.1.ple_key.weight")
         return include_ple_key && (tensor.type == 42 || tensor.type == 18 || tensor.type == 23 || tensor.type == 8);
+=======
+
+namespace strata::core {
+namespace {
+bool eligible(const std::string& name, bool include_ple_key) {
+    if (name.rfind("blk.", 0) != 0) return false;
+    if (include_ple_key && name == "blk.1.ple_key.weight") return true;
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
     static const char* suffixes[] = {".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
         ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_output.weight",
         ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight", ".ffn_down_shexp.weight"};
@@ -157,7 +162,6 @@ struct Pending {
     int type;
     uint64_t bytes;
     DevicePtr data;
-    DevicePtr packed;   // STRATA_Q8_PACKED=1 copy, or null
 };
 }
 
@@ -167,7 +171,7 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors())
-                if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
+                if (eligible(tensor.name, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
                     tensor.shape.size() == 2)
                     out.insert(tensor.name);
         }
@@ -178,6 +182,7 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     }
 }
 
+<<<<<<< this fork
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
 // The byte walk `load` does for the layers [lb, le), without the allocations: the same filters in the same order,
 // reading the GGUF headers and the canonical table only, so it needs no device.  A later stage's projections are not
@@ -244,49 +249,58 @@ NativeDense::~NativeDense() {
             for (void*& b : cl)
                 if (b != nullptr && std::find(weights_.begin(), weights_.end(), b) != weights_.end()) b = nullptr;
     for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
+=======
+NativeDense::~NativeDense() {
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
     if (scratch_) cudaFree(scratch_);
     for (void* p : weights_) cudaFree(p);
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
-    auto outside = [&](const std::string& name) {   // a blk.<l>. tensor of another stage's layers
-        if (layer_hi < 0 || name.rfind("blk.", 0) != 0) return false;
-        const long l = std::strtol(name.c_str() + 4, nullptr, 10);
-        return l < layer_lo || l >= layer_hi;
-    };
+                       bool include_ple_key) {
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
         std::vector<Pending> pending;
         std::set<std::string> seen;
         int max_in = 0;
-        uint64_t total = 0, hc_q8_bytes = 0, allocated = 0;
+        uint64_t total = 0;
         uint64_t split_count = 0, split_tensors = 0;
         std::set<uint64_t> split_numbers;
         bool have_architecture = false;
+        std::string first_arch;
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             const auto* count = gguf.get("split.count");
             const auto* number = gguf.get("split.no");
             const auto* tensors = gguf.get("split.tensors.count");
+<<<<<<< this fork
             if (gguf.get("general.architecture") && (!number || number->u == 0)) {
                 // splitter may copy general.architecture into every shard (Huihui abliterated re-split)
                 err = strata::check_engine_architecture(gguf);
+=======
+            const auto* architecture = gguf.get("general.architecture");
+            if (number && !split_numbers.insert(number->u).second) {
+                err = "native dense: duplicate split shard number"; return false;
+            }
+            // A re-split GGUF (Huihui's Q8_0) repeats general.architecture on every shard but keeps the
+            // architecture's numeric keys (block_count ...) on the first one only: the full guard is the first
+            // shard's (or a single file's); a later shard that names an architecture must name the same one
+            if (architecture && (!number || number->u == 0)) {
+                err = strata::check_architecture(gguf);
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
                 if (!err.empty()) return false;
                 have_architecture = true;
+                first_arch = architecture->s;
                 if (count && number && tensors && number->u == 0 && count->u > 1) {
                     split_count = count->u;
                     split_tensors = tensors->u;
                 }
             } else if (!have_architecture || !split_count || !count || !number || !tensors ||
                        count->u != split_count || number->u == 0 || number->u >= split_count ||
-                       tensors->u != split_tensors) {
+                       tensors->u != split_tensors || (architecture && architecture->s != first_arch)) {
                 err = "native dense: additional shard must match the architecture-validated first shard's split metadata";
                 return false;
-            }
-            if (number && !split_numbers.insert(number->u).second) {
-                err = "native dense: duplicate split shard number"; return false;
             }
             std::vector<uint64_t> offsets;
             for (const auto& tensor : gguf.tensors()) offsets.push_back(tensor.offset);
@@ -322,14 +336,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (next != offsets.end() && bytes > *next - tensor.offset) {
                     err = "native dense: overlapping payload " + tensor.name; return false;
                 }
-                // the uploads below read these: ask for them now so the reads overlap
-                if (eligible(tensor, include_ple_key) && !outside(tensor.name) &&
-                    strata::kernels::native_mmvq_supported(tensor.type))
-                    strata::platform::advise_willneed(gguf.tensor_data(tensor), bytes);
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
-                if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
+                if (!eligible(tensor.name, include_ple_key)) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
                 }
@@ -340,8 +349,6 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
                 if (!strata::kernels::native_mmvq_supported(tensor.type)) continue;
-                // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
-                if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;
                 if (!ref.quantized() || tensor.shape.size() != 2 ||
                     ref.ne0 <= 0 || ref.ne0 > INT_MAX || ref.ne1 <= 0 || ref.ne1 > INT_MAX ||
                     tensor.shape[0] != (uint64_t) ref.ne0 || tensor.shape[1] != (uint64_t) ref.ne1) {
@@ -359,28 +366,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
-                allocated += alloc_bytes(bytes);
-                // STRATA_Q8_PACKED=1: a second, packed copy of an eligible Q8_0 matrix for the decode MMVQ (the GGUF
-                // copy stays: the prompt path's GEMMs read it).
-                DevicePtr packed;
-                if (tensor.type == 8 && tensor.name != "blk.1.ple_key.weight" &&   // the PLE has its own kernel
-                    strata::kernels::native_q8_0_packed_enabled() &&
-                    strata::kernels::native_q8_0_packed_eligible((int) ref.ne0, (int) ref.ne1)) {
-                    std::vector<uint8_t> host(bytes);
-                    strata::kernels::native_q8_0_pack_host(gguf.tensor_data(tensor), host.data(), (int) ref.ne0,
-                                                           (int) ref.ne1);
-                    void* packed_allocation = nullptr;
-                    auto packed_status = cudaMalloc(&packed_allocation, bytes);
-                    packed.reset(packed_allocation);
-                    if (packed_status == cudaSuccess)
-                        packed_status = cudaMemcpy(packed.get(), host.data(), bytes, cudaMemcpyHostToDevice);
-                    if (packed_status != cudaSuccess) {
-                        err = "native dense packed upload " + tensor.name + ": " + cudaGetErrorString(packed_status);
-                        return false;
-                    }
-                }
-                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data), std::move(packed)});
+                pending.push_back(Pending{&ref, (int) tensor.type, bytes, std::move(data)});
             }
+<<<<<<< this fork
             if (hc_q8_env())
                 for (const auto& tensor : gguf.tensors()) {
                     // S25: the F32 inject rows hold BF16-exact values: the read takes the pack's BF16 rows unless
@@ -407,6 +395,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     weights_.push_back(p);
                     hc_q8_bytes += bytes;
                 }
+=======
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
         }
         if (hc_q8_env()) {
             // a bf16 pack stores no Q8_0 copy: quantize the layers' down / up projections. A row the arena kept
@@ -471,31 +461,22 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
         // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
-        uint64_t packed_bytes = 0;
-        size_t packed_count = 0;
         for (auto& item : pending) {
             item.ref->native_data = item.data.get();
             item.ref->native_type = item.type;
             item.ref->native_q8_1 = scratch.get();
-            if (item.packed) {
-                strata::kernels::native_q8_0_packed_register(item.data.get(), item.packed.get(), (int) item.ref->ne0,
-                                                             (int) item.ref->ne1);
-                packed_keys_.push_back(item.data.get());
-                packed_bytes += item.bytes;
-                ++packed_count;
-                weights_.push_back(item.packed.release());
-            }
             weights_.push_back(item.data.release());
         }
-        if (packed_count)
-            std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",
-                         packed_count, packed_bytes / 1048576.0);
         scratch_ = scratch.release();
+<<<<<<< this fork
         bytes_ = total + hc_q8_bytes;
         allocated_ = allocated;
         if (hc_q8_env())
             std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
                          (double) hc_q8_bytes / 1073741824.0);
+=======
+        bytes_ = total;
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
         return true;
     } catch (const std::exception& error) {
         err = std::string("native dense: ") + error.what();
