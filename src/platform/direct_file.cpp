@@ -1,6 +1,10 @@
 // src/platform/direct_file.cpp - see include/strata/platform/direct_file.hpp.
 #include "strata/platform/direct_file.hpp"
+<<<<<<< this fork
 #include "strata/platform/aux_cpus.hpp"
+=======
+#include "strata/platform/thread_affinity.hpp"
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
 
 #include <algorithm>
 #include <chrono>
@@ -185,7 +189,12 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     // Completions of reads that finish synchronously are still queued to the port, so every issued read
     // produces exactly one packet; `wait` is the only completion path.
     const int n = io_threads(4);
+<<<<<<< this fork
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { strata::aux_cpus::pin_current_thread(); impl_->worker(); });
+=======
+    for (int i = 0; i < n; ++i)
+        impl_->pool.emplace_back([this] { strata::platform::release_inherited_pin(); impl_->worker(); });
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
     return true;
 }
 
@@ -317,7 +326,12 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
     const int n = io_threads(16);
+<<<<<<< this fork
     for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { strata::aux_cpus::pin_current_thread(); impl_->worker(); });
+=======
+    for (int i = 0; i < n; ++i)
+        impl_->pool.emplace_back([this] { strata::platform::release_inherited_pin(); impl_->worker(); });
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
     return true;
 }
 
