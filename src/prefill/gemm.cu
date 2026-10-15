@@ -1,6 +1,9 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/prefill/kernels.hpp"
+#include "strata/core/fp16_mode.hpp"
+#include <cuda_fp16.h>
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
 #include "strata/prefill/moe_mmq.hpp"
 #endif
@@ -383,6 +386,7 @@ Gemm::~Gemm() {
     delete static_cast<HipLtState*>(hipblaslt_state_);
 #endif
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
+    if (w16_) cudaFree(w16_);
     if (tc_w_) cudaFree(tc_w_);
     if (tc_x_) cudaFree(tc_x_);
     if (!external_) {
@@ -459,6 +463,13 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     return true;
 }
 
+namespace {
+// STRATA_FP16=prefill's weight conversion (grid-stride, no clamp; the FP16 path below has its own)
+__global__ void bf16_to_f16_gs_kernel(const uint16_t* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
+    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) gridDim.x * blockDim.x)
+        y[i] = __half_as_ushort(__float2half_rn(__uint_as_float((uint32_t) x[i] << 16)));
+}
+}  // namespace
 #if !defined(__HIPCC__)
 // ---- below sm_80: BF16 GEMMs without BF16 tensor cores (PR #655, #540, #395) ----------------------------------------
 // Turing and Volta have no BF16 tensor cores: cublasGemmEx on CUDA_R_16BF inputs falls back to a SIMT fp32 kernel
@@ -624,6 +635,26 @@ bool Gemm::bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, flo
 void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                 float beta, int64_t ldx) {
     if (T <= 0 || N <= 0) return;
+    if (strata::fp16_mode() == strata::Fp16Mode::Prefill) {
+        // STRATA_FP16=prefill: X is already FP16 (the producers wrote FP16 images); W to FP16 here, every call: a
+        // weight's memory may be a staging buffer refilled under the same pointer (PLE), and the conversion is
+        // ~10 us per 6.5 MB weight.
+        const int64_t n = N * K;
+        if (n > w16_elems_) {
+            if (w16_) cudaFree(w16_);
+            w16_ = nullptr;
+            w16_elems_ = 0;
+            if (cudaMalloc((void**) &w16_, (size_t) n * 2) != cudaSuccess) {
+                std::fprintf(stderr, "prefill gemm: FP16 weight scratch of %lld elements\n", (long long) n);
+                std::exit(1);
+            }
+            w16_elems_ = n;
+        }
+        const int64_t blocks = (n + 255) / 256 < 4096 ? (n + 255) / 256 : 4096;
+        bf16_to_f16_gs_kernel<<<(unsigned) blocks, 256, 0, (cudaStream_t) stream_>>>(W, w16_, n);
+        f16(X, w16_, Y, T, N, K, ldy, beta);
+        return;
+    }
     if (ldy <= 0) ldy = N;
     if (ldx <= K) ldx = 0;
 #ifdef STRATA_USE_HIP
@@ -723,6 +754,16 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
        "cublasGemmEx");
     STRATA_ABSORB_HIPBLAS_STICKY("cublasGemmEx");
+}
+
+void Gemm::f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy, float beta) {
+    if (T <= 0 || N <= 0) return;
+    if (ldy <= 0) ldy = N;
+    const float alpha = 1.0f;
+    ck(cublasGemmEx((cublasHandle_t) handle_, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) T, (int) K, &alpha, W,
+                    CUDA_R_32F, (int) K, X, CUDA_R_32F, (int) K, &beta, Y, CUDA_R_32F, (int) ldy,
+                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+       "cublasGemmEx f32");
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
