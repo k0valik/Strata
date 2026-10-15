@@ -1,11 +1,8 @@
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
-#include "strata/core/progress.hpp"
-#include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <immintrin.h>
@@ -14,21 +11,22 @@
 #endif
 
 #include <cstdio>
-#include <cstdlib>
-#include <stdexcept>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include "pool_affinity_win.hpp"
 #else
 #include <pthread.h>
 #include <sched.h>
-#include "pool_affinity_linux.hpp"
+
+#include <fstream>
+#include <map>
+#include <string>
 #endif
 
 namespace strata::kernels::cpu {
 
+<<<<<<< this fork
 namespace {
 // STRATA_POOL_UMWAIT=<TSC cycles> (experimental, x86 WAITPKG only): a parked worker waits with UMONITOR/UMWAIT on the
 // epoch's cache line instead of spinning on _mm_pause.  It wakes when the host publishes (a write to that line) or
@@ -96,444 +94,266 @@ int planned_host_core(PoolAffinity affinity) { return detect_cpu_topology(true, 
 
 static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affinity) {
     CpuTopology topo;
+=======
+std::vector<std::vector<int>> physical_cores() {
+    std::vector<std::vector<int>> cores;
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
 #if defined(_WIN32)
     // Ask the OS rather than assuming a layout.  `hardware_concurrency()` returns LOGICAL processors, and on
     // every SMT machine half of them are siblings - pinning one worker to each of the first N would put two
     // workers on each physical core and halve the bandwidth the expert kernel is bound by.
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
-    if (len == 0) {
-        // Preserve group identity even when detailed core topology is unavailable.
-        const WORD groups = GetActiveProcessorGroupCount();
-        for (WORD group = 0; group < groups; ++group) {
-            const DWORD count = GetActiveProcessorCount(group);
-            if (count == 0 || count == (DWORD) -1 || count > 64) continue;
-            for (DWORD i = 0; i < count; ++i) topo.worker_cores.push_back((int) group * 64 + (int) i);
-        }
-        if (skip_first && !topo.worker_cores.empty()) {
-            topo.host_core = topo.worker_cores.front();
-            topo.worker_cores.erase(topo.worker_cores.begin());
-        }
-        return topo;
-    }
     std::vector<char> buf(len);
-    if (GetLogicalProcessorInformationEx(RelationProcessorCore,
-                                         (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
-        const char* p = buf.data();
-        const char* end = p + len;
-        struct CoreDesc {
-            uint8_t efficiency = 0;
-            bool has_smt = false;
-            std::vector<int> lps;
-        };
-        std::vector<CoreDesc> descs;
-        while (p < end) {
+    if (len > 0 && GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                                    (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len)) {
+        for (const char* p = buf.data(); p < buf.data() + len;) {
             const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
             if (e->Relationship == RelationProcessorCore) {
-                CoreDesc cd;
-                cd.efficiency = e->Processor.EfficiencyClass;
-                cd.has_smt = (e->Processor.Flags & LTP_PC_SMT) != 0;
-                for (WORD group = 0; group < e->Processor.GroupCount; ++group) {
-                    const GROUP_AFFINITY& g = e->Processor.GroupMask[group];
-                    for (int bit = 0; bit < 64; ++bit) {
-                        if (g.Mask & (KAFFINITY(1) << bit)) {
-                            cd.lps.push_back((int) (g.Group * 64 + bit));
-                        }
-                    }
-                }
-                if (!cd.lps.empty()) {
-                    descs.push_back(std::move(cd));
-                }
+                const GROUP_AFFINITY& g = e->Processor.GroupMask[0];
+                std::vector<int> core;
+                for (int bit = 0; bit < 64; ++bit)
+                    if (g.Mask & (1ull << bit)) core.push_back((int) (g.Group * 64 + bit));
+                if (!core.empty()) cores.push_back(core);
             }
             p += e->Size;
         }
-
-        uint8_t min_eff = 255, max_eff = 0;
-        for (const auto& c : descs) {
-            min_eff = (std::min)(min_eff, c.efficiency);
-            max_eff = (std::max)(max_eff, c.efficiency);
-        }
-
-        topo.is_hybrid = (max_eff > min_eff);
-        if (topo.is_hybrid) {
-            for (const auto& c : descs) {
-                if (c.efficiency == max_eff) {
-                    topo.p_cores++;
-                    topo.p_threads += (int) c.lps.size();
-                } else {
-                    topo.e_cores++;
-                }
-            }
-        } else {
-            topo.p_cores = (int) descs.size();
-            for (const auto& c : descs) topo.p_threads += (int) c.lps.size();
-        }
-
-        if (affinity == PoolAffinity::All || !topo.is_hybrid) {
-            // #642 (from Hardin22's fork): on a hybrid CPU the P-cores first (the host takes the first of them), so a
-            // pool smaller than the core count (setup's --pool-workers for a hybrid CPU) runs on the P-cores and the
-            // first E-cores rather than on whatever the OS numbered first.  All cores alike: the order is unchanged.
-            if (topo.is_hybrid)
-                std::stable_sort(descs.begin(), descs.end(),
-                                 [](const CoreDesc& x, const CoreDesc& y) { return x.efficiency > y.efficiency; });
-            for (const auto& c : descs) topo.worker_cores.push_back(c.lps[0]);
-            if (skip_first && !topo.worker_cores.empty()) {
-                topo.host_core = topo.worker_cores.front();
-                topo.worker_cores.erase(topo.worker_cores.begin());
-            }
-            return topo;
-        }
-
-        // Hybrid CPU with Auto or PCores affinity:
-        // Prioritize Performance cores:
-        // 1. Primary logical processor of each P-core (avoids SMT resource contention)
-        // 2. SMT sibling logical processors of P-cores
-        // 3. E-cores (only as overflow in Auto mode)
-        std::vector<int> p_primaries;
-        std::vector<int> p_siblings;
-        std::vector<int> e_cores;
-
-        for (const auto& c : descs) {
-            if (c.efficiency == max_eff) {
-                p_primaries.push_back(c.lps[0]);
-                for (size_t s = 1; s < c.lps.size(); ++s) {
-                    p_siblings.push_back(c.lps[s]);
-                }
-            } else {
-                for (int lp : c.lps) e_cores.push_back(lp);
-            }
-        }
-
-        if (skip_first && !p_primaries.empty()) {
-            topo.host_core = p_primaries.front();
-            p_primaries.erase(p_primaries.begin());
-        }
-
-        for (int cpu : p_primaries) topo.worker_cores.push_back(cpu);
-        for (int cpu : p_siblings) topo.worker_cores.push_back(cpu);
-        if (affinity != PoolAffinity::PCores) {
-            for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
-        }
-        return topo;
     }
 #else
-    // The logical CPUs this process may run on, ONE PER PHYSICAL CORE (issue #40): SMT siblings share a core's
-    // load/store bandwidth, so a worker on each would put two workers on one core, as the Windows branch above
-    // explains.  sysfs names each CPU's (package, core); the first allowed CPU of each pair is kept, so a taskset
-    // that leaves out the first sibling still gets its core.  Without sysfs every allowed CPU counts, as before.
-    auto topo_read = [](int cpu, const char* what) -> long {
-        char path[96];
-        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, what);
-        long v = -1;
-        if (std::FILE* f = std::fopen(path, "r")) {
-            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
-            std::fclose(f);
-        }
-        return v;
-    };
-    auto cap_read = [](int cpu) -> long {
-        char path[96];
-        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpu_capacity", cpu);
-        long v = -1;
-        if (std::FILE* f = std::fopen(path, "r")) {
-            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
-            std::fclose(f);
-        }
-        return v;
-    };
-
-    // #798: a cpulist ("0-7,16") of one of the hybrid PMU's CPU sets: /sys/devices/cpu_core/cpus and cpu_atom/cpus
-    auto cpulist_read = [](const char* path, std::vector<int>& out) -> bool {
-        std::FILE* f = std::fopen(path, "r");
-        if (!f) return false;
-        char text[1024] = {0};
-        const size_t n = std::fread(text, 1, sizeof text - 1, f);
-        std::fclose(f);
-        text[n] = '\0';
-        for (const char* p = text; *p;) {
-            char* end = nullptr;
-            const long lo = std::strtol(p, &end, 10);
-            if (end == p) break;
-            long hi = lo;
-            if (*end == '-') {
-                p = end + 1;
-                hi = std::strtol(p, &end, 10);
+    // The same grouping as Windows', from sysfs: the logical processors this process may run on, grouped by their
+    // core's sibling list ("0,8" or "0-1"), in the order of each core's first processor.  Treating every logical
+    // processor as a core put two workers on each core and the spinning host thread beside a worker: on a Ryzen 7
+    // 5700X (8 cores, 16 threads, UD-Q4_K_XL on an RTX 3090) 15 workers decoded 51.3 tok/s, 7 on 7 cores 58.4.
+    // Without sysfs (a container hiding it) each processor stays a core of its own, as before.
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof set, &set) == 0) {
+        std::map<std::string, size_t> core_at;
+        for (int i = 0; i < CPU_SETSIZE; ++i) {
+            if (!CPU_ISSET(i, &set)) continue;
+            std::string siblings;
+            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/topology/thread_siblings_list");
+            if (!(f && std::getline(f, siblings)) || siblings.empty()) {
+                cores.push_back({i});
+                continue;
             }
-            for (long c = lo; c <= hi && c < 4096; ++c) out.push_back((int) c);
-            p = end;
-            while (*p == ',' || *p == ' ' || *p == '\n')  ++p;
-        }
-        return !out.empty();
-    };
-
-    std::vector<int> allowed;
-    std::vector<unsigned long> allowed_mask;
-    if (detail::get_thread_affinity(allowed_mask, &allowed) != 0) {
-        for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) allowed.push_back((int) i);
-    }
-
-    struct CoreLinux {
-        int cpu = -1;
-        long pkg = -1;
-        long core = -1;
-        long cap = -1;
-        bool is_sibling = false;
-    };
-    std::vector<CoreLinux> all_cpus;
-    std::vector<std::pair<long, long>> seen_phys;
-    long max_cap = 0, min_cap = 1000000;
-
-    for (int cpu : allowed) {
-        CoreLinux cl;
-        cl.cpu = cpu;
-        cl.pkg = topo_read(cpu, "physical_package_id");
-        cl.core = topo_read(cpu, "core_id");
-        cl.cap = cap_read(cpu);
-        if (cl.cap > 0) {
-            max_cap = (std::max)(max_cap, cl.cap);
-            min_cap = (std::min)(min_cap, cl.cap);
-        }
-        if (cl.pkg >= 0 && cl.core >= 0) {
-            const std::pair<long, long> key{cl.pkg, cl.core};
-            if (std::find(seen_phys.begin(), seen_phys.end(), key) != seen_phys.end()) {
-                cl.is_sibling = true;
+            const auto it = core_at.find(siblings);
+            if (it == core_at.end()) {
+                core_at.emplace(siblings, cores.size());
+                cores.push_back({i});
             } else {
-                seen_phys.push_back(key);
+                cores[it->second].push_back(i);
             }
         }
-        all_cpus.push_back(cl);
     }
-
-    // #798: which CPUs are E-cores.  Intel's hybrid PMU lists them (cpu_atom/cpus beside cpu_core/cpus); without it a
-    // CPU is an E-core when its capacity is under 90% of the largest.  Turbo Boost Max 3.0 gives the "favored"
-    // P-cores a slightly higher capacity (1024 against 1012 on a Core Ultra 7 270K Plus): "capacity == the maximum"
-    // counted 2 of its 8 P-cores and started 1 pool worker.
-    std::vector<int> pmu_core, pmu_atom;
-    const bool pmu = cpulist_read("/sys/devices/cpu_core/cpus", pmu_core) &&
-                     cpulist_read("/sys/devices/cpu_atom/cpus", pmu_atom);
-    auto is_e = [&](const CoreLinux& cl) {
-        if (pmu) return std::find(pmu_atom.begin(), pmu_atom.end(), cl.cpu) != pmu_atom.end();
-        return max_cap > 0 && cl.cap > 0 && cl.cap * 10 < max_cap * 9;
-    };
-    bool any_e = false, any_p = false;
-    for (const auto& cl : all_cpus) (is_e(cl) ? any_e : any_p) = true;
-    topo.is_hybrid = any_e && any_p;
-    if (topo.is_hybrid) {
-        for (const auto& cl : all_cpus) {
-            if (!is_e(cl)) {
-                if (!cl.is_sibling) topo.p_cores++;
-                topo.p_threads++;
-            } else {
-                if (!cl.is_sibling) topo.e_cores++;
-            }
-        }
-    } else {
-        topo.p_cores = (int) seen_phys.size();
-        topo.p_threads = (int) all_cpus.size();
-    }
-
-    if (affinity == PoolAffinity::All || !topo.is_hybrid) {
-        if (topo.is_hybrid)   // #642: the P-cores first (see the Windows branch)
-            std::stable_sort(all_cpus.begin(), all_cpus.end(),
-                             [&](const CoreLinux& x, const CoreLinux& y) {
-                                 return is_e(x) != is_e(y) ? !is_e(x) : x.cap > y.cap;
-                             });
-        for (const auto& cl : all_cpus) {
-            if (!cl.is_sibling) topo.worker_cores.push_back(cl.cpu);
-        }
-        if (skip_first && !topo.worker_cores.empty()) {
-            topo.host_core = topo.worker_cores.front();
-            topo.worker_cores.erase(topo.worker_cores.begin());
-        }
-        return topo;
-    }
-
-    // Hybrid CPU on Linux:
-    std::vector<int> p_primaries;
-    std::vector<int> p_siblings;
-    std::vector<int> e_cores;
-
-    for (const auto& cl : all_cpus) {
-        if (!is_e(cl)) {
-            if (!cl.is_sibling) p_primaries.push_back(cl.cpu);
-            else p_siblings.push_back(cl.cpu);
-        } else {
-            e_cores.push_back(cl.cpu);
-        }
-    }
-
-    if (skip_first && !p_primaries.empty()) {
-        topo.host_core = p_primaries.front();
-        p_primaries.erase(p_primaries.begin());
-    }
-
-    for (int cpu : p_primaries) topo.worker_cores.push_back(cpu);
-    for (int cpu : p_siblings) topo.worker_cores.push_back(cpu);
-    if (affinity != PoolAffinity::PCores) {
-        for (int cpu : e_cores) topo.worker_cores.push_back(cpu);
-    }
-    return topo;
 #endif
-    return topo;
-}
-
-std::vector<int> physical_cores(bool skip_first, PoolAffinity affinity) {
-    return detect_cpu_topology(skip_first, affinity).worker_cores;
+    if (cores.empty())
+        for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) cores.push_back({(int) i});
+    return cores;
 }
 
 namespace {
 
-bool pin_this_thread(int core, [[maybe_unused]] int worker = -1) {
-    if (core < 0) return false;
 #if defined(_WIN32)
-    return detail::set_thread_group_affinity(core, worker);
+// Each logical processor's time in interrupts and DPCs so far (100 ns units), from NtQuerySystemInformation's
+// processor performance information (winternl.h names its DpcTime and InterruptTime Reserved1); the kernel adds to
+// them at each clock tick, so over a second they resolve ~1.6%.
+std::vector<uint64_t> interrupt_times() {
+    struct Info { LARGE_INTEGER idle, kernel, user, dpc, interrupt; ULONG interrupts; };
+    using Query = LONG(WINAPI*)(int, void*, ULONG, ULONG*);
+    static const Query query = reinterpret_cast<Query>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation")));
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    std::vector<Info> v(si.dwNumberOfProcessors);
+    ULONG len = 0;
+    std::vector<uint64_t> t;
+    if (query == nullptr || query(8, v.data(), (ULONG) (v.size() * sizeof(Info)), &len) != 0) return t;
+    for (const Info& i : v) t.push_back((uint64_t) (i.dpc.QuadPart + i.interrupt.QuadPart));
+    return t;
+}
+#endif
+
+constexpr double kBusy = 0.05;    // a processor over this share of a second in interrupts and DPCs takes them
+constexpr double kQuiet = 0.02;   // one below it may take a thread
+
+}  // namespace
+
+CorePlacement::CorePlacement(bool spare_first) : cores_(physical_cores()) {
+    for (size_t c = 0; c < cores_.size(); ++c)
+        for (int p : cores_[c]) {
+            if (p >= (int) core_of_.size()) core_of_.resize((size_t) p + 1, -1);
+            core_of_[(size_t) p] = (int) c;
+        }
+    host_ = cores_.back().front();
+    for (size_t c = spare_first && cores_.size() > 4 ? 1 : 0; c + 1 < cores_.size(); ++c)
+        workers_.push_back(cores_[c].front());
+}
+
+// A quiet processor for a thread on `from`: the first of the quietest free core whose processors are all quiet, else
+// the other processor of `from`'s own core, or -1.
+int CorePlacement::quiet_processor(int from, const std::vector<double>& load) const {
+    auto quiet = [&](int p) { return p < (int) load.size() && load[(size_t) p] < kQuiet && hot_[(size_t) p] == 0; };
+    std::vector<char> taken(cores_.size(), 0);
+    for (int p : workers_) taken[(size_t) core_of_[(size_t) p]] = 1;
+    taken[(size_t) core_of_[(size_t) host_]] = 1;
+    int best = -1;
+    double best_load = 0;
+    for (size_t c = 0; c < cores_.size(); ++c) {
+        if (taken[c]) continue;
+        bool ok = true;
+        double sum = 0;
+        for (int p : cores_[c]) {
+            ok = ok && quiet(p);
+            sum += p < (int) load.size() ? load[(size_t) p] : 0.0;
+        }
+        if (ok && (best < 0 || sum < best_load)) {
+            best = cores_[c].front();
+            best_load = sum;
+        }
+    }
+    if (best >= 0) return best;
+    for (int p : cores_[(size_t) core_of_[(size_t) from]])
+        if (p != from && quiet(p)) return p;
+    return -1;
+}
+
+std::string CorePlacement::tick(ExpertPool& pool) {
+#if defined(_WIN32)
+    const auto now = std::chrono::steady_clock::now();
+    const double s = std::chrono::duration<double>(now - at_).count();
+    if (!busy_.empty() && s < 1.0) return {};
+    std::vector<uint64_t> cur = interrupt_times();
+    // a first sample, or the engine idle since the last one (between requests): a new start, nothing to judge
+    const bool fresh = busy_.empty() || s > 3.0 || cur.size() != busy_.size();
+    std::vector<double> load(cur.size(), 0.0);
+    if (!fresh)
+        for (size_t p = 0; p < cur.size(); ++p) load[p] = (double) (cur[p] - busy_[p]) / 1e7 / s;
+    busy_ = std::move(cur);
+    at_ = now;
+    hot_.resize(busy_.size(), 0);
+    for (size_t p = 0; p < hot_.size(); ++p) hot_[p] = !fresh && load[p] > kBusy ? hot_[p] + 1 : 0;
+    std::string moved;
+    for (int t = -1; t < (int) workers_.size(); ++t) {   // the host, then the workers
+        int& at = t < 0 ? host_ : workers_[(size_t) t];
+        if (at >= (int) hot_.size() || hot_[(size_t) at] < 2) continue;
+        const int to = quiet_processor(at, load);
+        if (to < 0) continue;
+        if (t < 0) pin_current_thread(to);
+        else pool.pin_worker(t, to);
+        char line[160];
+        std::snprintf(line, sizeof line,
+                      "%slogical processor %d spent %.0f%% of the last second in interrupts and DPCs: "
+                      "the %s moved to %d", moved.empty() ? "" : "; ", at, 100.0 * load[(size_t) at],
+                      t < 0 ? "host thread" : "pool worker", to);
+        moved += line;
+        hot_[(size_t) at] = 0;
+        at = to;
+        ++moves;
+    }
+    return moved;
 #else
-    const int error = detail::pin_thread_to_cpu(core);
-    if (error != 0)
-        std::fprintf(stderr, "strata cpu pool: affinity for worker %d (CPU %d) failed: %d; previous affinity kept\n",
-                     worker, core, error);
-    return error == 0;
+    (void) pool;
+    return {};
+#endif
+}
+
+namespace {
+
+// `state_`: the epoch in the high half, then the closed bit, then the parked workers
+constexpr uint64_t kClosed = 1ull << 31;
+constexpr uint64_t kParked = kClosed - 1;
+constexpr uint64_t kEpoch = 1ull << 32;
+
+void pin_this_thread(int core) {
+    if (core < 0) return;
+#if defined(_WIN32)
+    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << (core & 63));
+#else
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
 #endif
 }
 
 }  // namespace
 
-ThreadAffinity pin_current_thread(int core) {
-    if (core < 0) return {};
+long long pin_current_thread(int core) {
+    if (core < 0) return -1;
 #if defined(_WIN32)
-    ThreadAffinity previous;
-    ULONG target = 0;
-    if (!detail::get_thread_cpu_sets(previous.cpu_sets) || !detail::cpu_set_for_core(core, target) ||
-        !SetThreadSelectedCpuSets(GetCurrentThread(), &target, 1)) {
-        std::fprintf(stderr, "strata cpu pool: host CPU Set selection for processor %d failed: %lu; previous placement kept\n",
-                     core, (unsigned long) GetLastError());
-        return {};
-    }
-    previous.valid = true;
-    return previous;
+    // `SetThreadAffinityMask` RETURNS the previous mask, or 0 on failure - so 0 doubles as the error, which is
+    // why the caller must not treat it as a restorable value.
+    const DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) 1 << (core & 63));
+    return prev == 0 ? -1 : (long long) prev;
 #else
-    ThreadAffinity previous;
-    int error = detail::get_thread_affinity(previous.mask);
-    if (error == 0) error = detail::pin_thread_to_cpu(core);
-    if (error != 0) {
-        std::fprintf(stderr, "strata cpu pool: host affinity for CPU %d failed: %d; previous affinity kept\n", core, error);
-        return {};
-    }
-    previous.valid = true;
-    return previous;
+    cpu_set_t prev;
+    CPU_ZERO(&prev);
+    if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return -1;
+    unsigned long mask = 0;
+    for (int i = 0; i < CPU_SETSIZE && i < 64; ++i)
+        if (CPU_ISSET(i, &prev)) mask |= 1ul << i;
+    pin_this_thread(core);
+    return (long long) mask;
 #endif
 }
 
-void restore_thread_affinity(const ThreadAffinity& previous) {
-    if (!previous.valid) return;
+void restore_thread_affinity(long long previous) {
+    if (previous <= 0) return;
 #if defined(_WIN32)
-    // Clearing an originally empty selection restores process-default/all-group eligibility without
-    // turning the caller's implicit Windows 11 affinity into an explicit single-group hard mask.
-    if (!SetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.empty() ? nullptr : previous.cpu_sets.data(),
-                                 (ULONG) previous.cpu_sets.size()))
-        std::fprintf(stderr, "strata cpu pool: host CPU Set restoration failed: %lu\n",
-                     (unsigned long) GetLastError());
+    SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR) previous);
 #else
-    const int error = detail::set_thread_affinity(previous.mask);
-    if (error != 0)
-        std::fprintf(stderr, "strata cpu pool: host affinity restoration failed: %d\n", error);
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 64; ++i)
+        if ((previous >> i) & 1) CPU_SET(i, &set);
+    pthread_setaffinity_np(pthread_self(), sizeof set, &set);
 #endif
 }
 
-namespace {
-std::atomic<const ExpertPool*> g_diag_pool{nullptr};
-void diag_active_pool(std::FILE* f) {
-    if (const ExpertPool* p = g_diag_pool.load()) p->diag(f);
-}
-int64_t now_ms() {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-}  // namespace
-
-void ExpertPool::diag(std::FILE* f) const {
-    const uint64_t h = head_.load();
-    std::fprintf(f, "  expert pool: epoch %u, batch epoch %u: %u of %u jobs claimed, %u done; %u of %d workers parked, "
-                    "%u sleeping; mode %d\n", epoch_.load(), (uint32_t) (h >> 32), (uint32_t) h & 0xffffu,
-                 (uint32_t) (h >> 16) & 0xffffu, done_.load(), parked_.load(), n_, sleepers_.load(), mode_);
-    std::fprintf(f, "  expert pool threads:");
-    for (int i = 0; i < n_; ++i) {
-        const int32_t s = wstate_[(size_t) i].load();
-        if (s == kParked) std::fprintf(f, " w%d=parked", i);
-        else if (s == kSleeping) std::fprintf(f, " w%d=sleeping", i);
-        else if (s == kBetween) std::fprintf(f, " w%d=draining", i);
-        else std::fprintf(f, " w%d=job%d", i, s);
-    }
-    const int32_t hs = hstate_.load();
-    const char* hn = hs == kIdle ? "idle" : hs == kWaitParked ? "waiting for the workers to park"
-                   : hs == kWaitDone ? "waiting for the jobs to finish" : "running a job";
-    std::fprintf(f, "; host %s", hn);
-    if (hs >= 0) std::fprintf(f, " %d", hs);
-    std::fprintf(f, " for %lld ms\n", (long long) (now_ms() - hstate_ms_.load()));
-}
-
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
-    : tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
-    if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
-    if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
-        spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
-    if (n_workers > 0) {
-        n_ = n_workers;
-    } else if (topo_.is_hybrid && affinity_ != PoolAffinity::All) {
-        n_ = (std::max)(1, topo_.p_cores - 1);
-    } else {
-        n_ = (int) topo_.worker_cores.size();
-    }
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, std::vector<int> cores) : host_works_(host_works) {
+    if (cores.empty()) cores = CorePlacement(false).workers();
+    n_ = n_workers > 0 ? n_workers : (int) cores.size();
     if (n_ < 1) n_ = 1;
+    state_.store(kClosed | (uint64_t) n_, std::memory_order_relaxed);   // epoch 0, closed, everyone parked
     scratch_.resize((size_t) n_);
-    wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
-    for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
-    hstate_ms_.store(now_ms());
-    g_diag_pool.store(this);
-    strata::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
+    fstate_.reset(new FusedState[(size_t) kMaxSplitMulti]);
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
-        const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
+        const int core = pin ? (i < (int) cores.size() ? cores[(size_t) i] : -1) : -1;
         threads_.emplace_back([this, i, core] {
-            strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
-            pin_this_thread(core, i);
+            pin_this_thread(core);
             worker(i);
         });
     }
 }
 
+void ExpertPool::pin_worker(int i, int core) {
+    if (i < 0 || i >= (int) threads_.size() || core < 0) return;
+#if defined(_WIN32)
+    SetThreadAffinityMask((HANDLE) threads_[(size_t) i].native_handle(), (DWORD_PTR) 1 << (core & 63));
+#else
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    pthread_setaffinity_np(threads_[(size_t) i].native_handle(), sizeof set, &set);
+#endif
+}
+
 ExpertPool::~ExpertPool() {
-    const ExpertPool* self = this;
-    g_diag_pool.compare_exchange_strong(self, nullptr);
-    stop_.store(true, std::memory_order_release);
-    // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
-    publish();
+    stop_.store(true, std::memory_order_seq_cst);
+    // a new value, so a sleeping worker's wait returns and it sees the stop flag
+    state_.fetch_add(kEpoch, std::memory_order_seq_cst);
+    state_.notify_all();
     for (auto& t : threads_) t.join();
 }
 
-void ExpertPool::publish() {
-    // Both sides are seq_cst, and that is the whole lost-wakeup argument: a worker going to sleep does
-    // `sleepers_++` and then reads `epoch_`, the host does `epoch_++` and then reads `sleepers_`.  In one total
-    // order at least one of them sees the other's write - the worker sees the new epoch and does not sleep, or
-    // the host sees the sleeper and notifies under the mutex the worker holds until it is inside `wait`.
-    // On x86 the fetch_add is a locked xadd either way, so this costs the token path nothing.
-    epoch_.fetch_add(1, std::memory_order_seq_cst);
-    if (sleepers_.load(std::memory_order_seq_cst) != 0) {
-        std::lock_guard<std::mutex> lk(sleep_mu_);
-        sleep_cv_.notify_all();
-    }
-}
-
 void ExpertPool::worker(int id) {
-    uint32_t seen = 0;
-    // ARRIVE at the park before the first wait, so `parked_ == n_` is true from construction.  Counting only
-    // on the RETURN from a drain leaves `parked_` at 0 until each worker has finished one batch, and the first
-    // `run()` - which waits for `parked_ == n_` before publishing - then deadlocks.  It deadlocks on the very
-    // first call, which is the good case; a version that deadlocked on the second would be far worse.
-    parked_.fetch_add(1, std::memory_order_acq_rel);
+    uint32_t seen = 0;   // the last epoch this worker joined
     for (;;) {
+<<<<<<< this fork
         // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the
         // sibling hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these
         // iterations are spent here with nothing to do.
@@ -577,99 +397,63 @@ void ExpertPool::worker(int id) {
             });
             sleepers_.fetch_sub(1, std::memory_order_relaxed);
             wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
+=======
+        // Park: wait for an open phase this worker has not joined.  `_mm_pause` rather than a bare spin because
+        // it yields the pipeline to the sibling hyperthread.  The loop writes nothing shared (see the note on
+        // the atomics in pool.hpp) until it joins, or goes to sleep after `kIdleSpin` without work.
+        uint64_t s = state_.load(std::memory_order_acquire);
+        auto idle_from = std::chrono::steady_clock::now();
+        for (uint32_t spins = 1;; ++spins) {
+            if (stop_.load(std::memory_order_relaxed)) return;
+            if (!(s & kClosed) && (uint32_t) (s >> 32) != seen) {
+                // join; fails when the host has closed this phase or other workers joined since `s` was read
+                if (state_.compare_exchange_weak(s, s - 1, std::memory_order_acq_rel, std::memory_order_acquire)) break;
+                continue;
+            }
+            _mm_pause();
+            if (spins % 1024 == 0 && std::chrono::steady_clock::now() - idle_from > kIdleSpin) {
+                // seq_cst, against open_phase's store then load: the host sees this sleeper or this worker's
+                // wait sees the new epoch
+                sleepers_.fetch_add(1, std::memory_order_seq_cst);
+                sleeps_.fetch_add(1, std::memory_order_relaxed);
+                state_.wait(s, std::memory_order_seq_cst);
+                sleepers_.fetch_sub(1, std::memory_order_seq_cst);
+                idle_from = std::chrono::steady_clock::now();
+            }
+            s = state_.load(std::memory_order_acquire);
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
         }
-        if (stop_.load(std::memory_order_acquire)) return;
-        // acquire: the batch this epoch published (`head`, and the description before it) is visible from here
-        seen = epoch_.load(std::memory_order_acquire);
-        parked_.fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
+        seen = (uint32_t) (s >> 32);
 
         // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
-        // Every job is the same size (all experts are 1,382,400 bytes), so there is nothing to schedule.  Only
-        // this epoch's jobs: if the host has already moved on, the claims fail and the worker parks again.
-        wstate_[(size_t) id].store(kBetween, std::memory_order_relaxed);
-        drain(id, scratch_[(size_t) id], seen);
-        wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
-        parked_.fetch_add(1, std::memory_order_acq_rel);   // back at the park
+        // Every job is the same size (all experts are 1,382,400 bytes), so there is nothing to schedule.
+        drain(id, scratch_[(size_t) id]);
+        state_.fetch_add(1, std::memory_order_release);   // parked again
     }
 }
 
-int ExpertPool::claim(uint32_t epoch) {
-    uint64_t h = head_.load(std::memory_order_acquire);
-    for (;;) {
-        if ((uint32_t) (h >> 32) != epoch) return -1;               // not the batch this thread woke for
-        const uint32_t n = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
-        if (i >= n) return -1;                                       // exhausted
-        if (head_.compare_exchange_weak(h, h + 1, std::memory_order_acq_rel, std::memory_order_acquire))
-            return (int) i;
-    }
+void ExpertPool::open_phase() {
+    // The previous phase is closed, so no worker is inside a drain and none can join until this store.
+    const uint64_t s = state_.load(std::memory_order_relaxed);
+    state_.store(((s >> 32) + 1) << 32 | (uint64_t) n_, std::memory_order_seq_cst);
+    if (sleepers_.load(std::memory_order_seq_cst) != 0) state_.notify_all();
 }
 
-uint32_t ExpertPool::begin_batch(int n) {
-    if (n < 0 || n > 0xffff) {
-        std::fprintf(stderr, "strata: expert pool batch of %d jobs is out of range\n", n);
-        std::abort();
-    }
-    // Every job of the previous batch has completed (`wait_done`), and a claim of it can no longer succeed, so
-    // nothing adds to `done` until this batch's first claim - which the release below orders after the reset.
-    done_.store(0, std::memory_order_relaxed);
-    const uint32_t e = epoch_.load(std::memory_order_relaxed) + 1;   // only the host bumps the epoch
-    head_.store(pack_head(e, (uint32_t) n, 0), std::memory_order_release);
-    publish();
-    return e;
-}
-
-void ExpertPool::wait_parked(const char* what) {
-    hstate_.store(kWaitParked, std::memory_order_relaxed);
-    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
-    uint32_t spins = 0;
-    std::chrono::steady_clock::time_point t0{};
-    while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) {
+void ExpertPool::close_phase() {
+    // Every job is done; wait for the workers that joined to park again, and shut the phase in the same step,
+    // so a worker that notices it late cannot join it.
+    const uint64_t open = (state_.load(std::memory_order_relaxed) & ~kParked) | (uint64_t) n_;
+    for (uint64_t s = open;
+         !state_.compare_exchange_weak(s, open | kClosed, std::memory_order_acq_rel, std::memory_order_relaxed);
+         s = open)
         _mm_pause();
-        if ((++spins & 1023u) != 0) continue;
-        const auto now = std::chrono::steady_clock::now();
-        if (spins == 1024u) t0 = now;
-        else if (now - t0 > kStall) {
-            std::fprintf(stderr, "strata: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
-                                 "so the server can start it again (issue #29)\n",
-                         what, parked_.load(), n_);
-            strata::core::release_gpu_waits(stderr);   // #267: the GPU may be spinning on this layer's flag
-            std::fflush(stderr);
-            std::abort();
-        }
-    }
 }
 
-void ExpertPool::wait_done(int n) {
-    hstate_.store(kWaitDone, std::memory_order_relaxed);
-    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
-    uint32_t spins = 0, seen = 0;
-    std::chrono::steady_clock::time_point t0{};
-    for (;;) {
-        const uint32_t d = done_.load(std::memory_order_acquire);
-        if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
-        _mm_pause();
-        if ((++spins & 1023u) != 0) continue;
-        const auto now = std::chrono::steady_clock::now();
-        if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
-        else if (now - t0 > kStall) {
-            std::fprintf(stderr, "strata: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
-                                 "stopping the engine so the server can start it again (issue #29)\n",
-                         d, n, parked_.load(), n_);
-            strata::core::release_gpu_waits(stderr);   // #267
-            std::fflush(stderr);
-            std::abort();
-        }
-    }
-}
-
-void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
+void ExpertPool::drain(int id, ExpertScratch& scratch) {
     (void) id;
     for (;;) {
-        const int ci = claim(epoch);
-        if (ci < 0) break;
-        const uint32_t i = (uint32_t) ci;
-        if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
-        else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
+        const uint32_t i = head_.fetch_add(1, std::memory_order_relaxed);
+        if (i >= (uint32_t) njobs_) break;
         if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
@@ -681,6 +465,24 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ == 7) {
+            // the fused native layer (run_fused_native): every expert's gate/up parts, then every expert's down
+            // parts, claimed in that order; a down part waits (spins) for its expert's h, which the thread that
+            // finishes the expert's last gate/up part quantizes.  Every gate/up part is claimed before any down
+            // part, so a waiting down part only waits for work already running.
+            const int na = fn_ * fa_;
+            if ((int) i < na) {
+                const int e = (int) i / fa_, part = (int) i % fa_;
+                native_gu_part(e, FF * part / fa_, FF * (part + 1) / fa_);
+                if (fstate_[(size_t) e].gu_done.fetch_add(1, std::memory_order_acq_rel) + 1 == fa_) {
+                    native_quant_part(e);
+                    fstate_[(size_t) e].ready.store(1, std::memory_order_release);
+                }
+            } else {
+                const int j = (int) i - na, e = j / fb_, part = j % fb_;
+                while (fstate_[(size_t) e].ready.load(std::memory_order_acquire) == 0) _mm_pause();
+                native_down_part(e, H * part / fb_, H * (part + 1) / fb_);
+            }
         } else if (mode_ >= 5) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows (the layer's own n_ff / n_embd: Flash-Next's
             // FF / H, or another family's smaller expert)
@@ -689,34 +491,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
-                SplitBufMulti& sb = split_multi_[(size_t) e];
-                if (mode_ == 5 && q2_native_kernels(nfmt_->gu_type)) {
-                    // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
-                    float* gp[MAXT];
-                    float* up[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-                    const int nbk = (int) (nfmt_->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
-                    for (int t = 0; t < mjobs_[e].nt; ++t)
-                        for (int r = r0; r < r1; ++r)
-                            sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
-                } else if (mode_ == 5) {
-                    float* ff[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                } else if (q2_native_kernels(nfmt_->d_type)) {
-                    // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
-                    const ActQ* a2[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
-                                mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                } else {
-                    const void* hq[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                }
+                if (mode_ == 5) native_gu_part(e, r0, r1);
+                else native_down_part(e, r0, r1);
                 r += r1 - r0;
             }
         } else {
@@ -743,16 +519,16 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     }
 }
 
-void ExpertPool::run_phase(int mode, int n_tasks) {
-    wait_parked("before a phase");
+void ExpertPool::run_phase(int mode, int n_tasks, void (*first)(void*), void* ctx) {
     mode_ = mode;
     njobs_ = n_tasks;
-    const uint32_t e = begin_batch(n_tasks);
-    if (host_works_) drain(-1, host_scratch_, e);
-    wait_done(n_tasks);
-    wait_parked("after a phase");
-    hstate_.store(kIdle, std::memory_order_relaxed);
-    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    head_.store(0, std::memory_order_relaxed);
+    done_.store(0, std::memory_order_relaxed);
+    open_phase();
+    if (first != nullptr) first(ctx);
+    if (host_works_) drain(-1, host_scratch_);
+    while (done_.load(std::memory_order_acquire) != (uint32_t) n_tasks) _mm_pause();
+    close_phase();
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {
@@ -769,10 +545,6 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
     run_phase(2, n * parts_b_);
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-}
-
-int ExpertPool::phase_tasks(int64_t rows) const {
-    return tasks_ == 0 ? 3 * (n_ + (host_works_ ? 1 : 0)) : (int) (std::min)(rows, (int64_t) tasks_);
 }
 
 void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
@@ -794,8 +566,9 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     mjobs_ = jobs;
+    const int threads = n_ + (host_works_ ? 1 : 0);
+    mtasks_ = 3 * threads;
     mrows_ = (int64_t) n * FF;
-    mtasks_ = phase_tasks(mrows_);
     run_phase(3, mtasks_);
     const auto t1 = std::chrono::steady_clock::now();
     for (int e = 0; e < n; ++e)
@@ -803,7 +576,6 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
             act_quant_q8_1(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
     const auto t2 = std::chrono::steady_clock::now();
     mrows_ = (int64_t) n * H;
-    mtasks_ = phase_tasks(mrows_);
     run_phase(4, mtasks_);
     const auto t3 = std::chrono::steady_clock::now();
     ms_multi_gu += std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -814,26 +586,40 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
-void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
-    if (n <= 0) return;
+void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, void (*first)(void*),
+                                        void* ctx) {
+    if (n <= 0) {
+        if (first != nullptr) first(ctx);
+        return;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
+<<<<<<< this fork
         mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = phase_tasks(mrows_);
+=======
+        const int threads = n_ + (host_works_ ? 1 : 0);
+        mtasks_ = 3 * threads;
+        mrows_ = (int64_t) nb * FF;
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
         const auto a = std::chrono::steady_clock::now();
-        run_phase(5, mtasks_);
+        run_phase(5, mtasks_, b0 == 0 ? first : nullptr, ctx);
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                if (f.d_type == 42) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
         const auto c = std::chrono::steady_clock::now();
+<<<<<<< this fork
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = phase_tasks(mrows_);
+=======
+        mrows_ = (int64_t) nb * H;
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
         run_phase(6, mtasks_);
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
@@ -845,29 +631,93 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+void ExpertPool::native_gu_part(int e, int r0, int r1) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    if (nfmt_->gu_type == 42) {
+        // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
+        thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+        float* gp[MAXT];
+        float* up[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+        const int nbk = (int) (nfmt_->n_embd / 64);
+        q2_rows_any(mjobs_[e].blob, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
+        q2_rows_any(mjobs_[e].blob + nfmt_->up_off, nfmt_->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
+        for (int t = 0; t < mjobs_[e].nt; ++t)
+            for (int r = r0; r < r1; ++r)
+                sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+    } else {
+        float* ff[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+        native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+    }
+}
+
+void ExpertPool::native_quant_part(int e) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    for (int t = 0; t < mjobs_[e].nt; ++t)
+        if (nfmt_->d_type == 42) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+        else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
+}
+
+void ExpertPool::native_down_part(int e, int r0, int r1) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    if (nfmt_->d_type == 42) {
+        // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
+        const ActQ* a2[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
+        q2_rows_any(mjobs_[e].blob + nfmt_->down_off, nfmt_->d_row, (int) (nfmt_->n_ff / 64), a2,
+                    mjobs_[e].nt, mjobs_[e].out, r0, r1);
+    } else {
+        const void* hq[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+        native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+    }
+}
+
+void ExpertPool::run_fused_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, void (*first)(void*),
+                                  void* ctx) {
+    if (n <= 0 || n > kMaxSplitMulti) { run_split_multi_native(f, jobs, n, first, ctx); return; }
+    const auto t0 = std::chrono::steady_clock::now();
+    mjobs_ = jobs;
+    nfmt_ = &f;
+    fn_ = n;
+    const int threads = n_ + (host_works_ ? 1 : 0);
+    // about three parts per thread over the layer's experts in each half, as the two-phase path cuts them
+    fa_ = (std::max)(1, (3 * threads + n - 1) / n);
+    fb_ = fa_;
+    for (int e = 0; e < n; ++e) {   // every worker is parked (the previous phase closed): published by open_phase
+        fstate_[(size_t) e].gu_done.store(0, std::memory_order_relaxed);
+        fstate_[(size_t) e].ready.store(0, std::memory_order_relaxed);
+    }
+    run_phase(7, n * fa_ + n * fb_, first, ctx);
+    ms_multi_gu += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    mode_ = 0;
+    ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
 void ExpertPool::run(ExpertJob* jobs, int n) {
     if (n <= 0) return;
     if (n_ == 1) {   // no workers: run inline, so a single-core machine still produces a token
         for (int i = 0; i < n; ++i) s2_expert_vnni_q(jobs[i].blob, *jobs[i].act, jobs[i].out, scratch_[0]);
         return;
     }
-    // Wait for every worker to be parked BEFORE touching the batch, so the publish below is the only thing
-    // that can move a worker into the drain loop.
+    // The previous phase is closed, so no worker can be in the drain loop while the batch is written.
     //
-    // THE THREE PHASES ARE TIMED SEPARATELY.  They were one number, which cannot distinguish a pool that is
-    // slow at the WORK from one that is slow at the SYNCHRONISATION - and those need opposite fixes.
-    const auto t_a = std::chrono::steady_clock::now();
-    wait_parked("before a batch");
+    // THE PHASES ARE TIMED SEPARATELY.  They were one number, which cannot distinguish a pool that is slow at
+    // the WORK from one that is slow at the SYNCHRONISATION - and those need opposite fixes.
     const auto t_b = std::chrono::steady_clock::now();
     jobs_ = jobs;
     njobs_ = n;
     mode_ = 0;
-    const uint32_t e = begin_batch(n);   // done, then head (release), then the epoch: the batch is described first
+    head_.store(0, std::memory_order_relaxed);
+    done_.store(0, std::memory_order_relaxed);
+    open_phase();   // seq_cst: jobs_/njobs_ are visible to a worker that joins
 
     // ---- **THE HOST DRAINS TOO (R2.2), INSTEAD OF SPINNING ON `done_`.**
     //
-    // The loop below used to be `while (done_ != n) _mm_pause();`.  The host is pinned to core 0 - the core
-    // `physical_cores(true)` deliberately keeps the five workers off - so for the whole drain that core was
+    // The loop below used to be `while (done_ != n) _mm_pause();`.  The host is pinned to its own core - the
+    // one `CorePlacement` deliberately keeps the workers off - so for the whole drain that core was
     // idle while five cores did six cores' worth of work.  Measured before the change: 33.7 GB/s against
     // 5/6 x 44.14 = 36.8 for five workers and 44.14 for six.
     //
@@ -880,28 +730,23 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
     // device after `run()` returns, so the write must be published, not merely performed.
     if (host_works_) {
         for (;;) {
-            const int ci = claim(e);
-            if (ci < 0) break;
-            hstate_.store(ci, std::memory_order_relaxed);
-            hstate_ms_.store(now_ms(), std::memory_order_relaxed);
-            const ExpertJob& j = jobs_[ci];
+            const uint32_t i = head_.fetch_add(1, std::memory_order_relaxed);
+            if (i >= (uint32_t) n) break;
+            const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, host_scratch_);
             done_.fetch_add(1, std::memory_order_release);
         }
     }
 
-    wait_done(n);
-    // And park again, so the next `run` starts from a known state.  See the header for why `done` alone is
-    // not enough.
+    while (done_.load(std::memory_order_acquire) != (uint32_t) n) _mm_pause();
+    // And close the phase, so the next `run` starts from a known state.  See the header for why `done` alone
+    // is not enough.
     const auto t_c = std::chrono::steady_clock::now();
-    wait_parked("after a batch");
-    hstate_.store(kIdle, std::memory_order_relaxed);
-    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    close_phase();
     const auto t_d = std::chrono::steady_clock::now();
 
-    ms_wait_park_ += std::chrono::duration<double, std::milli>(t_b - t_a).count();
     ms_drain_ += std::chrono::duration<double, std::milli>(t_c - t_b).count();
-    ms_repark_ += std::chrono::duration<double, std::milli>(t_d - t_c).count();
+    ms_close_ += std::chrono::duration<double, std::milli>(t_d - t_c).count();
 }
 
 }  // namespace strata::kernels::cpu

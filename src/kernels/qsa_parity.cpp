@@ -47,7 +47,6 @@
 //     1e-3 for FP16 paths.  That difference is the FP16 CACHE's cost, not the kernel's, and it is kept
 //     separate so a kernel bug cannot hide inside it.
 #include "strata/kernels/qsa.hpp"
-#include "strata/kernels/native_qsa_indexer.hpp"
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/rope.hpp"
@@ -764,7 +763,7 @@ int main(int argc, char** argv) {
         const int64_t max_blocks = max_n / R + 1;
         const int64_t cap = strata::kernels::qsa_selection_width(max_n, S);
         Dev<float> pooled, query, scores((size_t) max_n);
-        Dev<int32_t> ids((size_t) cap), step(strata::kernels::kStepCount);
+        Dev<int32_t> sel((size_t) cap), step(strata::kernels::kStepCount);
         pooled.put(std::vector<float>((size_t) max_blocks * IDXD, 0.0f));
         query.put(std::vector<float>((size_t) IDXN * IDXD, 0.0f));
 
@@ -774,7 +773,7 @@ int main(int argc, char** argv) {
         check(cudaStreamCreate(&stream), "tail stream");
         check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "tail capture begin");
         strata::kernels::qsa_index_step(pooled.p, query.p, nullptr, S, step.p, max_blocks, scores.p, stream);
-        strata::kernels::topk_512_step(scores.p, S, cap, step.p, ids.p, stream);
+        strata::kernels::topk_512_step(scores.p, S, cap, step.p, sel.p, stream);
         check(cudaStreamEndCapture(stream, &graph), "tail capture end");
         check(cudaGraphInstantiate(&exec, graph, 0), "tail instantiate");
 
@@ -790,15 +789,15 @@ int main(int argc, char** argv) {
             for (int64_t j = n - tail; j < n; ++j) want.push_back((int32_t) j);
 
             strata::kernels::qsa_index(pooled.p, n / R, query.p, nullptr, S, n, scores.p, nullptr);
-            strata::kernels::topk_512(scores.p, n, S, cap, ids.p, nullptr);
-            require("tail static n=" + std::to_string(n), ids.get((size_t) width) == want);
+            strata::kernels::topk_512(scores.p, n, S, cap, sel.p, nullptr);
+            require("tail static n=" + std::to_string(n), sel.get((size_t) width) == want);
 
             std::vector<int32_t> values(strata::kernels::kStepCount);
             strata::kernels::qsa_step_fill(values.data(), n - 1, S);
             step.put(values);
             check(cudaGraphLaunch(exec, stream), "tail replay");
             check(cudaStreamSynchronize(stream), "tail replay sync");
-            require("tail captured n=" + std::to_string(n), ids.get((size_t) width) == want);
+            require("tail captured n=" + std::to_string(n), sel.get((size_t) width) == want);
             const auto actual_scores = scores.get((size_t) n);
             bool exact_scores = true;
             for (int64_t j = 0; j < n; ++j) {
@@ -1377,6 +1376,7 @@ int main(int argc, char** argv) {
         check(cudaGraphDestroy(g2), "gd");
     }
 
+<<<<<<< this fork
     // ================= the NATIVE indexer's batched append vs the sequential one =================
     // The prefill path appends a chunk in one native_qsa_indexer_append_batch call, the decode path appends
     // token by token - and one cache must never be able to tell which path filled it (rope_scaling.hpp's
@@ -1629,6 +1629,8 @@ int main(int argc, char** argv) {
         check(cudaStreamDestroy(cs), "csd");
     }
 
+=======
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
     std::printf("\nqsa: %d failures\n", g_bad);
     if (g_bad) return 1;
     if (selftest) std::printf("qsa_parity OK\n");
