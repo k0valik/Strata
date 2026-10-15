@@ -14,8 +14,8 @@
 //     fallback is the common case and not an error path.
 #pragma once
 
-#include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -23,11 +23,6 @@
 namespace strata::core {
 
 enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
-
-/// #243: STRATA_ARENA_PIN_GIB, the cap on the expert arena's CUDA registration in GiB.  -1 when unset (the engine
-/// decides, as in 0.1.30), 0 = no cap (the whole arena, or as many slices as the driver takes), N > 0 = at most N GiB,
-/// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
-int arena_pin_cap_gib();
 
 struct PinnedArena {
     void* base = nullptr;
@@ -46,6 +41,7 @@ struct PinnedArena {
     explicit PinnedArena(uint64_t bytes, uint64_t slice = 0);
     /// Plan v0.3 P6: slices of different sizes (one per layer of a native pack), given as their start offsets
     /// followed by the end of the last one.  `slice_starts` holds the registered ones.
+<<<<<<< this fork
     /// `max_pinned_bytes`: optional cap on CUDA registration. 0 preserves the normal unrestricted path.
     /// `shared_file`: on Linux, use a file-backed MAP_SHARED mapping instead of anonymous memory.
     /// `shared_pack_hash` identifies the pack that is allowed to populate that backing.  The file carries a
@@ -74,9 +70,10 @@ struct PinnedArena {
     /// returns (a slice CUDA refuses ends the registration, and the rest is kept resident by the working-set lock).
     void register_slices(std::atomic<int>& ready);
     std::vector<uint64_t> bounds_;
+=======
+    PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds);
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
     std::vector<uint64_t> slice_starts;
-    void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
-    uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;
     PinnedArena& operator=(const PinnedArena&) = delete;
@@ -87,40 +84,15 @@ struct PinnedArena {
 
 struct LoadStats {
     double seconds = 0.0;
-    // Loader fix: the two halves of `seconds`, both SUMMED OVER THE READER THREADS rather than wall clock, so
-    // either can exceed `seconds` when the threads overlap.  They exist to separate the read from the copy and
-    // the hash: an 8 MiB chunk that reaches the disk as ~2048 4 KiB reads spends its time in the first one.
-    double read_seconds = 0.0;                  // inside the read call only: no seek, no copy, no hash
-    double copy_seconds = 0.0;                  // memcpy + FNV-1a
-    // A short read is not a slow load, it is a WRONG one: the caller must refuse the pack rather than run
-    // on an arena whose tail was never written.  `seconds` alone cannot say that (it is -1.0 on failure, but
-    // the caller's own check is on the REQUESTED byte count, which a refused read does not change).
-    bool ok = true;                             // false: the load failed, see `error`
-    std::string error;                          // why it failed, for the caller's message
     uint64_t bytes = 0;
     uint64_t layers = 0;
     std::vector<uint64_t> layer_checksums;      // one FNV-1a per layer
     double gib_per_second() const { return seconds > 0 ? (double) bytes / (1024.0 * 1024 * 1024) / seconds : 0.0; }
-    // Aggregate rate of the readers WHILE THEY WERE INSIDE THE READ CALL: `bytes` over the mean per-thread
-    // read time.  `gib_per_second()` above divides the same bytes by the wall clock of the whole loop, which
-    // also contains the copy and the hash, so the two differ by how much of the loop was not I/O.
-    double read_gib_per_second(int threads) const {
-        if (read_seconds <= 0.0 || threads < 1) return 0.0;
-        return (double) bytes / (1024.0 * 1024 * 1024) / (read_seconds / (double) threads);
-    }
 };
 
 // Load `layers` layers of the expert arena into `dst` with `threads` readers, `chunk` bytes at a time.
 // Each thread opens its OWN handle and seeks, which is the portable form of parallel pread: a shared handle
 // needs a lock around the seek and defeats the parallelism on Windows.
-//
-// The reads go through `fread()` on a per-thread `FILE*`, NOT through `std::ifstream`.  MSVC's
-// `basic_filebuf::xsgetn` splits every request larger than `_INTERNAL_BUFSIZ - 1` into 4095-byte `fread()`
-// calls, so an 8 MiB `chunk` reached the disk as ~2048 4 KiB operations and the chunking did nothing at all
-// (measured on a 42.9 GB pack: 1222 s, 4096 bytes per operation, 0.03 GiB/s).  `fread()` hands a request
-// larger than the stream buffer straight to `_read()`/`ReadFile()`, which is what `chunk` is for.  The
-// control flow, the copy, the per-layer FNV-1a and therefore the checksums are unchanged, so a pack loaded
-// by the old and the new reader must produce identical `layer_checksums`.
 LoadStats load_experts(const std::string& path, uint8_t* dst, uint64_t blob_bytes, uint64_t blobs_per_layer,
                        uint64_t layers, int threads, uint64_t chunk);
 /// Pin by need: the arena's page-aligned blob stride.  Layer L's blob e sits at `dst_off[L] + e * stride[L]` (stride =
@@ -134,6 +106,7 @@ struct PadMap {
     }
 };
 /// Plan v0.3 P6: the same with one byte range per layer (`layer_off[L]`, `layer_bytes[L]`).
+<<<<<<< this fork
 /// `pad` (optional): the destination is the padded layout above (`layer_off` stays the file offsets).
 /// `ready` (optional): layer L is written only once *ready > L + 1 - its slice and the next one registered (a
 /// PinnedArena registering its slices meanwhile: writing a page while cudaHostRegister runs on it corrupted the
@@ -165,6 +138,15 @@ LoadStats load_experts_direct(const std::string& path, uint8_t* dst, const std::
 constexpr uint64_t kAllFileBytes = ~0ull;
 bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_bytes, std::string& why,
                         bool cache_counts = true, uint64_t read_bytes = kAllFileBytes);
+=======
+/// Layer L's `layer_bytes[L]` bytes at file offset `layer_off[L]` go to `layer_dst[L]`.
+/// `done(L)`, when given, runs on the reading thread once layer L is in place.
+LoadStats load_experts_ranges(const std::string& path, const std::vector<uint8_t*>& layer_dst,
+                              const std::vector<uint64_t>& layer_off, const std::vector<uint64_t>& layer_bytes, int threads,
+                              uint64_t chunk, const std::function<void(uint64_t)>& done = nullptr);
+LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
+                              const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk);
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
 
 // FNV-1a 64.  Per layer, so a corrupt or short read names WHICH layer rather than just failing a whole-file
 // comparison - the same reason the Phase 1 tools report the first differing element.

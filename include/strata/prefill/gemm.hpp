@@ -6,7 +6,6 @@
 // rounded to BF16, which is also what llama.cpp's batched CUDA path does.  Tensor-core GEMM through cuBLAS.
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -19,76 +18,51 @@ public:
     Gemm(const Gemm&) = delete;
     Gemm& operator=(const Gemm&) = delete;
 
-    /// `scratch_elems`: BF16 elements of the dequantization scratch (the largest weight dequantized at once).
-    bool init(void* stream, int64_t scratch_elems, std::string& err);
-    /// The same with caller-owned device buffers (the prompt path borrowing expert-cache slots).
-    bool init_external(void* stream, uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes,
-                       std::string& err);
+    /// The cuBLAS handle on `stream`, and with `side_streams` the side streams f16_grouped() spreads over;
+    /// set_buffers() before the first product.
+    bool init(void* stream, std::string& err, bool side_streams = false);
+    /// Caller-owned device buffers (e.g. lent expert-cache slots): the dequantization scratch (`scratch_elems` FP16
+    /// elements: the largest weight dequantized at once; may be null for no native() calls) and the cuBLAS workspace.
+    void set_buffers(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
 
     /// Y[T, N] (fp32, row stride ldy) = X[T, K] (bf16, row-major) . W[N, K]^T (bf16, row-major).  `beta` = 1 adds.
-    /// Below sm_80 (no BF16 tensor cores): Volta converts both to FP16 and runs the FP16 tensor-core GEMM (Turing with
-    /// STRATA_BF16_TC=1), Pascal widens both to fp32 (cublasSgemm); see gemm.cu.
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
-              float beta = 0.0f, int64_t ldx = 0);
-
-    /// S (STRATA_HCD_EXACT): the HC down projection (N 320, K 10240) by the WMMA kernel that reproduces hipBLASLt's
-    /// solution 1176 / 1177 bit for bit; false (nothing launched) unless hipBLASLt would take one of those for this
-    /// shape (so the caller falls back to bf16(), with the same ldx).
-    bool bf16_hcd_exact(const uint16_t* X, int64_t ldx, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K);
+              float beta = 0.0f);
 
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
              float beta = 0.0f);
 
-    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.  `ldx` (> K) is
-    /// X's padded row stride, taken only by STRATA_PF_PAD's path (0 = K).
-    /// On an MMQ build a beta = 0 product whose type is covered, whose K is a multiple of 256 values and whose matrix fits
-    /// the card's shared memory runs through llama.cpp's int8 MMQ instead (opt-in: STRATA_DENSE_MMQ=1).
+    /// Y_i[rows[i], N] = X_i[rows[i], K] . W_i[N, K]^T (FP16 in, FP32 out) for n problems of one shape but their
+    /// own row counts, in one cuBLAS grouped call; the pointer arrays are DEVICE memory, `rows` host memory.  Where
+    /// cuBLAS does not group these types it runs f16() per problem, from the host copies of the pointers, spread
+    /// over the side streams when the problems average 128 rows or more (a GEMM of a few hundred rows leaves most
+    /// of the GPU idle; below that the launches, not the GPU, set the pace).
+    void f16_grouped(const uint16_t* const* X, const uint16_t* const* W, float* const* Y, const uint16_t* const* X_host,
+                     const uint16_t* const* W_host, float* const* Y_host, const int* rows, int n, int64_t N, int64_t K);
+
+    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                int64_t ldy = 0, float beta = 0.0f, int64_t ldx = 0);
-
-    /// HIP gfx103x (prompt_f16()): bf16() takes X as the FP16 image the prompt path's kernels write (set_act_f16),
-    /// and bf16() / f16() / native() run the GEMM with FP16 out (rocBLAS's tuned kernels there), widened in place in
-    /// Y's own rows.  Off (default): every call is what it was.  Set by Prefill::init, together with set_act_f16.
-    void set_f16_io(bool on) { f16_io_ = on; }
-
-    /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
-    void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
+                int64_t ldy = 0, float beta = 0.0f);
 
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
 
 private:
+    static constexpr int AUX = 3;   // side streams for independent products
     void* handle_ = nullptr;
     void* stream_ = nullptr;
+    void* aux_handle_[AUX] = {};
+    void* aux_stream_[AUX] = {};
+    void* fork_ = nullptr;
+    void* join_[AUX] = {};
     uint16_t* scratch_ = nullptr;
     int64_t scratch_elems_ = 0;
-    void* workspace_ = nullptr;
-    bool external_ = false;
-    void* hipblaslt_state_ = nullptr;
-    bool f16_io_ = false;
-    /// cuBLAS 12 answers the default FP16 algorithm of a few (N, K) shapes with CUBLAS_STATUS_INTERNAL_ERROR once
-    /// another CUDA device in the process has initialized its context (issue #1650, Turing + Pascal).  A fixed
-    /// algorithm (ALGO2) survives that state, but is markedly slower for the wide shapes, so only the shapes that
-    /// fail move, and they are remembered here ((K << 32) | N, up to kF16AlgoSlots).  CUDA only.
-    static constexpr int kF16AlgoSlots = 32;
-    int64_t f16_algo_shape_[kF16AlgoSlots] = {};
-    int f16_algo_n_ = 0;
-    // below sm_80: FP16 (Pascal: fp32) copies of a BF16 product's weight and activation slice (Gemm::bf16)
-    uint16_t* tc_w_ = nullptr;
-    int64_t tc_w_elems_ = 0;
-    uint16_t* tc_x_ = nullptr;
-    int64_t tc_x_elems_ = 0;
-    bool native_mmq(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                    int64_t ldy);
-    void* mmq_ctx_ = nullptr;
-    void* mmq_buf_ = nullptr;
-    bool mmq_failed_ = false;
-    /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
-    void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
+    bool grouped_ = true;   // cuBLAS groups FP16 -> FP32 GEMMs (cleared at the first refusal)
 };
 
+<<<<<<< this fork
 /// Pascal, opt-in: Gemm::f16's large dense shapes as cublasSgemm on FP32 copies (gemm.cu; bitwise the FP16 call's
 /// result at the sizes it takes with the cuBLAS it was measured on).  0 off, 1 on (any card), -1 the default
 /// (STRATA_DENSE_F32=1 on compute capability 6.x, else off).  For gemm_f32_parity; a no-op outside the experimental
@@ -102,4 +76,6 @@ bool prompt_f16();
 
 
 
+=======
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
 }  // namespace strata::prefill

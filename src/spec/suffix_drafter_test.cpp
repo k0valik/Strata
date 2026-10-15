@@ -12,6 +12,7 @@
 // No model runs; this measures the drafter on text, not on the model's own outputs.
 #include "strata/spec/suffix_drafter.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -103,7 +104,7 @@ void unit_tests() {
         const int n = d.propose(6, out);
         check(n >= 3 && out[0] == 1 && out[1] == 2 && out[2] == 3, "periodic continuation");
     }
-    {   // bounded memory: appending beyond the nominal capacity does not crash and still works
+    {   // beyond the nominal capacity the table grows
         SuffixDrafter d(3, 32, 1024);
         std::vector<int32_t> doc;
         for (int i = 0; i < 5000; ++i) doc.push_back(i % 997);
@@ -111,22 +112,53 @@ void unit_tests() {
         int32_t out[4];
         check(d.propose(4, out) > 0, "propose after overflow of nominal capacity");
     }
-    {
-        // --lookup-chain: the match continues from the drafts appended to the history, which stays unchanged
+    {   // assign: the shared prefix stays, the rest of the old text proposes nothing
+        SuffixDrafter d;
+        const std::vector<int32_t> a = {1, 2, 3, 4, 5, 6, 7, 8, 9, 1, 2, 3};
+        d.append(a.data(), a.size());
+        int32_t out[4];
+        check(d.propose(4, out) > 0 && out[0] == 4, "before assign");
+        const std::vector<int32_t> b = {1, 2, 3, 40, 50, 60, 70, 1, 2, 3};
+        d.assign(b.data(), b.size());
+        check(d.size() == b.size(), "assign replaces the history");
+        const int n = d.propose(4, out);
+        check(n == 4 && out[0] == 40 && out[3] == 70, "the new text's continuation, not the old one's");
+        d.assign(a.data(), a.size());
+        check(d.propose(4, out) == 4 && out[0] == 4 && out[3] == 7, "the old text again");
+    }
+    {   // many texts: the slots of undone positions are dropped when the table is rebuilt
         SuffixDrafter d(3, 32, 256);
-        const int32_t hist[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 50, 51, 52, 1, 2};
-        d.append(hist, sizeof(hist) / sizeof(hist[0]));
-        const int32_t drafts[] = {3, 4};
-        int32_t out[8] = {};
-        const int k = d.propose_after(drafts, 2, 3, out);
-        check(k == 3 && out[0] == 5 && out[1] == 6 && out[2] == 7, "propose_after continues after the drafts");
-        check(d.last_match() >= 4, "propose_after match length counts the drafts");
-        check(d.size() == sizeof(hist) / sizeof(hist[0]), "propose_after leaves the history unchanged");
-        const int32_t miss[] = {99, 98, 97};
-        check(d.propose_after(miss, 3, 3, out) == 0, "propose_after without a match proposes nothing");
-        // the plain proposal is unaffected: the history's own suffix (52, 1, 2) has no earlier occurrence
-        check(d.propose(3, out) == 0, "propose after propose_after");
-        check(d.propose_after(nullptr, 0, 3, out) == d.propose(3, out), "propose_after with no drafts == propose");
+        std::vector<int32_t> doc(200);
+        for (int r = 0; r < 50; ++r) {
+            for (int i = 0; i < 200; ++i) doc[(size_t) i] = r * 1000 + i % 150;
+            d.assign(doc.data(), doc.size());
+        }
+        int32_t out[4];
+        check(d.propose(4, out) == 4 && out[0] == 49000 + 50, "propose after many texts");
+    }
+    {   // proposals depend on the history alone: after assign undid a longer text and the table grew, as a fresh
+        // drafter's (a 6-token alphabet: every trigram recurs, more often than WAYS)
+        uint32_t rng = 12345;
+        auto next = [&] { rng = rng * 1664525u + 1013904223u; return (int32_t) ((rng >> 16) % 6); };
+        std::vector<int32_t> a(3000), b;
+        for (int32_t& t : a) t = next();
+        b.assign(a.begin(), a.begin() + 1700);
+        for (int i = 0; i < 1300; ++i) b.push_back(next());
+        SuffixDrafter x(3, 32, 16), y(3, 32, 1u << 14);
+        x.append(a.data(), a.size());
+        x.assign(b.data(), 1000);
+        x.append(b.data() + 1000, b.size() - 1000);
+        y.append(b.data(), b.size());
+        bool same = x.size() == y.size();
+        int32_t ox[8], oy[8];
+        for (int i = 0; i < 300 && same; ++i) {
+            const int nx = x.propose(8, ox), ny = y.propose(8, oy);
+            same = nx == ny && x.last_match() == y.last_match() && std::equal(ox, ox + nx, oy);
+            const int32_t t = next();
+            x.append(t);
+            y.append(t);
+        }
+        check(same, "proposals after assign and growth are a fresh drafter's");
     }
     std::printf("suffix_drafter unit tests: %s\n", g_fail ? "FAILED" : "OK");
 }

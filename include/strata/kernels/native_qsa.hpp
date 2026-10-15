@@ -21,10 +21,12 @@ bool native_qsa_enabled();
 void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float* output,
                                   int n_cols, int n_rows, float epsilon, void* stream);
 
-// The same per row with gamma[n_cols * groups]: row r is normalized on its own and scaled by gamma's slice
-// r % groups (the MTP's hidden input, one row per hyper-connection stream: --mtp-hnorm stream).
-void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* output,
-                                 int n_cols, int groups, int n_rows, float epsilon, void* stream);
+// native_qsa_rms_norm_weighted, then native_rope_apply_tokens (64 rotated columns) on its output, in one launch and
+// bitwise both: n_rows rows of n_cols (128 or 256) read at input + r * in_stride, written contiguously to output;
+// row r's position is positions[(r / heads) * pos_stride + r % heads].  output == input needs in_stride == n_cols.
+void native_qsa_norm_rope_tokens(const float* input, int in_stride, const float* gamma, float* output, int n_cols,
+                                 int n_rows, float epsilon, int n_rot, float freq_base, const int* positions, int heads,
+                                 int pos_stride, void* stream);
 
 // attn/output [head_dim,n_head]; q_full [2*head_dim,n_head], each row is
 // [query channels, gate channels]. Output is attn*sigmoid(second-half gate).

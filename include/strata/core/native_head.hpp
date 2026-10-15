@@ -9,9 +9,8 @@ namespace strata::core {
 
 /// Opt-in native output projection. Uploads unchanged GGUF blocks once at startup and owns its
 /// activation scratch. The normal canonical head remains available for numerical A/B comparisons.
-/// Plan v0.3 P6: any type the native MMVQ takes (Q5_K in the Q2_0 / IQ3_XXS files, IQ4_XS in IQ2_XS).
-/// `load` takes the model's shards (strata::gguf_split_paths): the architecture is checked on the first, the
-/// tensor is read from the shard that holds it.
+/// Plan v0.3 P6: any type the native MMVQ takes (Q5_K in the Q2_0 / IQ3_XXS files, IQ4_XS in IQ2_XS, Q8_0 in
+/// UD-Q4_K_XL).  `load` takes the model's shards (strata::gguf_split_paths).
 class NativeHead {
 public:
     NativeHead() = default;
@@ -31,6 +30,11 @@ public:
     int device() const { return device_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
+    /// The rows held: all of the vocabulary, or the first ones after keep_rows.
+    int64_t rows() const { return n_out_; }
+    /// Keeps rows [0, rows) (the rest of the head runs on another GPU: split_head.hpp) and frees the others' VRAM.
+    /// `run` then refuses: it would give part of a token's logits.
+    bool keep_rows(int64_t rows, std::string& err);
 
 private:
     void* weights_ = nullptr;
@@ -38,7 +42,11 @@ private:
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
+<<<<<<< this fork
     int device_ = -1;
+=======
+    bool part_ = false;
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row

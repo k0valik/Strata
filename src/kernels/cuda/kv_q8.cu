@@ -27,22 +27,19 @@ void validate(const QsaShapes& s, const char* what) {
 }
 
 // One block = one 64-value group of one KV head of K (blockIdx.z = 0) or V (1); 64 threads, one value each.
-// MULTI (S26 STRATA_LFUSE): blockIdx.z = 2 * token + (K / V); token j reads step + j * step_stride and its rows at
-// kcur / vcur + j * cur_stride - every token's code is the single launch's
-template <bool MULTI = false>
 __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict__ v_q,
                                     uint16_t* __restrict__ k_scale, uint16_t* __restrict__ v_scale,
                                     const int32_t* __restrict__ table, const int32_t* __restrict__ step,
                                     const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
-                                    int head_dim, int page_size, KvHostPools host, int step_stride = 0,
-                                    int cur_stride = 0) {
-    if constexpr (MULTI) {
-        const int j = blockIdx.z >> 1;
-        step += (size_t) j * step_stride; kcur += (size_t) j * cur_stride; vcur += (size_t) j * cur_stride;
-    }
+                                    int head_dim, int page_size, int step_stride, int sides) {
+    // blockIdx.z = 2 * token + (0 K, 1 V), or the token when one side is appended
+    const int tok = sides == 3 ? blockIdx.z >> 1 : blockIdx.z;
+    step += (size_t) tok * step_stride;
+    kcur += (size_t) tok * kv_heads * head_dim;
+    vcur += (size_t) tok * kv_heads * head_dim;
     const long long pos = (long long) __ldg(step + kStepPos);
     const int h = blockIdx.x, g = blockIdx.y, t = threadIdx.x;
-    const bool is_v = MULTI ? (blockIdx.z & 1) == 1 : blockIdx.z == 1;
+    const bool is_v = sides == 3 ? (blockIdx.z & 1) == 1 : sides == 2;
     const int groups = head_dim / KV_Q8_GROUP;
     const float x = (is_v ? vcur : kcur)[h * head_dim + g * KV_Q8_GROUP + t];
     // max |x| over the 64 values: two warps, then combine through shared memory in a fixed order
@@ -59,18 +56,10 @@ __global__ void kv_append_q8_kernel(int8_t* __restrict__ k_q, int8_t* __restrict
         q = __float2int_rn(x / sf);
         q = q < -127 ? -127 : (q > 127 ? 127 : q);
     }
-    // KV streaming: the host copy (identity layout) always, the VRAM page only if the block is resident
     const long long page = (long long) table[pos / page_size];
-    if (page >= 0) {
-        const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
-        (is_v ? v_q : k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
-        if (t == 0) (is_v ? v_scale : k_scale)[row * groups + g] = sbits;
-    }
-    if (host.k_q != nullptr) {
-        const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
-        (is_v ? host.v_q : host.k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
-        if (t == 0) (is_v ? host.v_scale : host.k_scale)[row * groups + g] = sbits;
-    }
+    const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
+    (is_v ? v_q : k_q)[row * head_dim + g * KV_Q8_GROUP + t] = (int8_t) q;
+    if (t == 0) (is_v ? v_scale : k_scale)[row * groups + g] = sbits;
 }
 
 // One thread = 4 consecutive values of one cell and head (as the FP16 gather does with uint2).
@@ -109,26 +98,21 @@ __global__ void kv_gather_q8_kernel(const int8_t* __restrict__ k_q, const int8_t
 }  // namespace
 
 void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
-                       const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
-                       const KvHostPools* host) {
+                       const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream) {
     validate(s, "kv_append_q8");
-    const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / KV_Q8_GROUP), 2);
-    kv_append_q8_kernel<<<grid, KV_Q8_GROUP, 0, (cudaStream_t) stream>>>(
-        k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim,
-        (int) s.page_size, host ? *host : KvHostPools{});
-    check("kv_append_q8 launch");
+    kv_append_q8_steps(k_q, v_q, k_scale, v_scale, page_table, step, 0, kcur, vcur, 1, s, stream);
 }
 
 void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
-                        const int32_t* step, int step_stride, const float* kcur, const float* vcur, int cur_stride,
-                        int n_tok, const QsaShapes& s, void* stream, const KvHostPools* host) {
-    validate(s, "kv_append_q8 (steps)");
-    if (n_tok < 1) return;
-    const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / KV_Q8_GROUP), (unsigned) (2 * n_tok));
-    kv_append_q8_kernel<true><<<grid, KV_Q8_GROUP, 0, (cudaStream_t) stream>>>(
+                        const int32_t* step, int step_stride, const float* kcur, const float* vcur, int n_tok,
+                        const QsaShapes& s, void* stream, int sides) {
+    validate(s, "kv_append_q8");
+    if (n_tok < 1 || sides < 1 || sides > 3) return;
+    const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / KV_Q8_GROUP), (unsigned) ((sides == 3 ? 2 : 1) * n_tok));
+    kv_append_q8_kernel<<<grid, KV_Q8_GROUP, 0, (cudaStream_t) stream>>>(
         k_q, v_q, k_scale, v_scale, page_table, step, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim,
-        (int) s.page_size, host ? *host : KvHostPools{}, step_stride, cur_stride);
-    check("kv_append_q8 (steps) launch");
+        (int) s.page_size, step_stride, sides);
+    check("kv_append_q8 launch");
 }
 
 void kv_gather_q8_step(const int8_t* k_q, const int8_t* v_q, const uint16_t* k_scale, const uint16_t* v_scale,

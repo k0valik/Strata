@@ -16,23 +16,39 @@
 //   * the attention is DENSE over every cell the layer has seen - identical to the model's sparse selection
 //     below 2,051 cells - so speculative cells (draft steps, rejected window rows) never touch indexer state and
 //     are simply overwritten when their positions are processed again;
-//   * all 512 routed experts live in VRAM (708 MB) and run through the grouped hit kernels.
+//   * all 512 routed experts live in VRAM and run through the grouped kernels: raw GGUF blocks in the formats
+//     `experts.txt` names, through the main model's native expert kernels, or else the Q2_0 blob layout (708 MB);
+//   * the K/V of a prompt's cells come from the batched prompt path (`prompt_kv`), in its GEMM arithmetic, as the
+//     model's own layers there.
 #pragma once
 
 #include "strata/core/layer.hpp"
-#include "strata/core/pinned_ring.hpp"
 #include "strata/core/session.hpp"
-#include "strata/kernels/sampler.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
 namespace strata::core {
 
 class NativeHead;
+
+/// What the batched prompt path needs for the draft layer's K/V over a prompt (strata/prefill/prefill.hpp): the two
+/// input norms and projections, the attention hyper-connection read, the K and V projections and the K norm.
+struct MtpPromptKv {
+    const float *norm_emb = nullptr, *norm_hidden = nullptr;   ///< [n_embd], [hc * n_embd]
+    const void *fc_emb = nullptr, *fc_hidden = nullptr;        ///< Q8_0 [n_embd, n_embd]
+    const float* hc_norm = nullptr;                             ///< [hc * n_embd]
+    const uint16_t *hc_down = nullptr, *hc_up = nullptr;        ///< BF16 [hc_lr, hc * n_embd], [hc * n_embd, hc_lr]
+    const void *k_proj = nullptr, *v_proj = nullptr;            ///< Q8_0 [n_head_kv * head_dim, n_embd]
+    const float* k_norm = nullptr;                              ///< [head_dim]
+    QsaState* kv = nullptr;                                     ///< the layer's K/V cells
+    int64_t first_cell = 0;                                     ///< cells before it the window never reaches again
+};
 
 class MtpDrafter {
 public:
@@ -44,42 +60,18 @@ public:
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-              int64_t window = 32768, const MtpDrafter* shared = nullptr);
-    /// The prompt's length: prefill() skips the cells the attention window can never reach again.
+              int64_t window = 32768);
+    /// The prompt's length: the prompt's K/V skip the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
-    /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
-    /// the verifier's STRATA_ROUTE_RESIDENT, with `res_row` (a device residency row of 512 experts: slot or -1) as the
-    /// table.  nullptr switches it off.
-    void set_route_resident(const int32_t* res_row, float margin, int lo, int hi) {
-        rr_res_ = res_row; rr_margin_ = margin; rr_lo_ = lo; rr_hi_ = hi;
-    }
-    /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
-    void set_max_drafts(int k) { max_drafts_ = k; }
-    /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
-    /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.
-    void set_hnorm_per_stream(bool on) { hnorm_stream_ = on; }
-    bool hnorm_per_stream() const { return hnorm_stream_; }
-    /// --mtp-q4 (opt-in; before load): the draft layer's Q8_0 projections and its draft head run from 4-bit (Q4_0)
-    /// copies made at load/bind - fewer bytes per draft step; drafts only, the verify window decides every token.
-    /// (The prompt path's batched K/V pass keeps the Q8_0 originals.)
-    void set_q4(bool proj, bool head) { q4_ = proj; q4_head_ = head; }
-    /// --mtp-draft-vocab FILE (opt-in; before bind): the draft head's token subset from FILE instead of
-    /// rt/draft_vocab.bin (e.g. data/draft_vocab_en.bin, 40K tokens)
-    void set_draft_vocab(const std::string& path) { dvocab_path_ = path; }
-    /// STRATA_MTP_TOP2=1 (diagnostic): draft j's runner-up token in the last draft() (-1 = unknown)
-    static bool top2_env();
-    int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
-    int max_t() const { return max_t_; }
+    /// The draft chain stops after `n` drafts (0: max_t - 1).
+    void set_max_drafts(int n) { max_drafts_ = n; }
     uint64_t vram_bytes() const { return vram_; }
-    /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
-    const QsaState& kv_state() const { return st_; }
-    /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
-    /// `upto` (a conversation-cache resume). No-op unless the drafter's K/V is a ring.
-    void kv_restore(int64_t upto);
-    /// The VRAM bind() will allocate for a native head of `head_row_bytes` per vocabulary row: the draft logits and
-    /// the draft head over rt/draft_vocab.bin's subset.  The expert cache is sized before bind(), so it reserves this.
-    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
+    /// The layer's own K/V cells (the prompt cache stashes them with the model's).
+    QsaState& kv_state() { return st_; }
+    /// The weights and cells the batched prompt path computes the prompt's K/V with (after load and set_prompt_len).
+    MtpPromptKv prompt_kv();
     /// The main model's embedding and head, and the verify window's final residuals (T rows, hc*n_embd each).
+<<<<<<< this fork
     bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
               const MtpDrafter* shared = nullptr);
     void set_window_R(const float* window_R) { window_R_ = window_R; }
@@ -93,6 +85,9 @@ public:
     /// so a later prefill(sync = false) of a window neither captures nor allocates (both wait for the device).
     bool prepare_prefill(std::string& err);
     cudaStream_t stream() const { return cs_; }
+=======
+    bool bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err);
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
 
     /// One round: catch-up over T cells from `p` (rows = the window's final residuals, `tokens` = the window's
     /// argmaxes: row t pairs R_{p+t} with the token at p+t+1), then the draft chain from row `a` (the last
@@ -101,25 +96,18 @@ public:
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
+    /// The draft head's rows gathered from the main head now (before the main GPU keeps only part of it); `bind`
+    /// then takes them as they are.
+    bool bind_head(const NativeHead* head, std::string& err);
+    bool has_draft_head() const { return dhead_ != nullptr; }
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
-    /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
-    /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
-    /// the target's Philox draw for the verifying row, and `probs` is the draft's probability under that chain; a
-    /// greedy one keeps the argmax drafts and their graphs.  A no-op when the switch is off.
-    void set_draft_sampling(const strata::kernels::SamplerParams& sp);
-    /// Coupled mode with penalties: the history the next draft() chain starts from - what the session holds after the
-    /// window's commit (`tail`) and the window's pick at its last accepted row (`next`, the next window's row 0).
-    void set_draft_history(const int32_t* tail, int64_t n_tail, int32_t next);
-    void set_ple_session(SessionState* s) { ple_ss_ = s; }
-    bool coupled() const { return coupled_active_; }
-    /// PROBABILISTIC DRAFT ACCEPTANCE (core/spec_prob.hpp, STRATA_SPEC_PROB=1): this request's drafts are SAMPLED from
-    /// q and each draft j's distribution is in spec_q() + j * kSpecQStride (ids, -1 terminated; then float bits),
-    /// valid on the host once draft() has returned.  False for greedy requests and where the mode is off.
-    bool prob() const { return coupled_active_ && h_q_ != nullptr; }
-    const int32_t* spec_q() const { return h_q_; }
+    /// Called with each draft as soon as it is known (j = 0.., its probability under the draft layer), while the
+    /// chain goes on: the next window's PLE rows start there.
+    std::function<void(int j, int32_t token, float prob)> on_draft;
 
+<<<<<<< this fork
     // ---- --pipeline-windows 2: the chain as one asynchronous launch (the round and its steps back to back, no host
     // wait), its first `n_force` steps fed the given tokens instead of their own picks (teacher forcing: the drafts of
     // a window already in flight), each output read once the event after its step has completed.
@@ -148,20 +136,10 @@ public:
     double ms_draft = 0, ms_prefill = 0;
     double ms_src = 0;      ///< the host time spent staging the source rows (a cross-card copy when the drafter is on another card)
     int64_t n_src = 0;
+=======
+    double ms_draft = 0;
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
     int64_t rounds = 0;
-
-    /// E-9: the prompt path computes this layer's prompt K/V in batches (Prefill::draft_kv): its tensors, its K/V
-    /// state, the first cell a round can still read, its device, and a wait for its own stream.
-    const float* tensor_f32(const char* name) const { return f32(name); }
-    const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
-    const void* tensor_q8(const char* name) const { return q8(name); }
-    QsaState& kv_state_rw() { return st_; }
-    int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
-    int device() const { return device_; }
-    bool idle(std::string& err) {
-        if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
-        return true;
-    }
 
 private:
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
@@ -172,79 +150,34 @@ private:
     /// the head, the draft and its probability.  Needs row 0's R_, inj_ and mixed_ (its q8_1 rows in xq_).
     bool record_rest(int step_row, cudaStream_t cs, std::string& err);
     void norm_rope(float* data, const float* gamma, int rows, int cols, const int32_t* p, cudaStream_t cs);
-    bool capture_prefill(int T, std::string& err);
-    bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
-    bool capture_round(int T, bool coupled, std::string& err);
-    bool capture_step(int j, bool coupled, std::string& err);
+    bool capture_round(int T, std::string& err);
+    bool capture_step(int j, std::string& err);
     cudaGraphExec_t step_exec_[9] = {};
-    // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
-    // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
-    bool setup_coupled(std::string& err);
-    cudaGraphExec_t round_exec_c_[9] = {};
-    cudaGraphExec_t step_exec_c_[9] = {};
-    bool coupled_ok_ = false, coupled_active_ = false;
-    bool coupled_rec_ = false;   ///< record_forward: the full layer ends in the coupled sampler (draft coupled_j_)
-    int coupled_j_ = 0;
-    strata::kernels::SamplerParams *h_cparams_ = nullptr, *m_cparams_ = nullptr, *cparams_ = nullptr;
-    int32_t *h_chist_ = nullptr, *m_chist_ = nullptr, *cring_ = nullptr, *dinv_ = nullptr;
-    int32_t *h_q_ = nullptr, *m_q_ = nullptr;   ///< STRATA_SPEC_PROB: the drafts' q lists (mapped, max_t_ rows)
-    void* cscratch_ = nullptr;
     const float* f32(const char* name) const;
     const uint16_t* bf16(const char* name) const;
     const void* q8(const char* name) const;
 
     const ModelGeometry* g_ = nullptr;
     SessionState* ss_ = nullptr;
-    SessionState* ple_ss_ = nullptr;
     const WeightTable* wt_ = nullptr;
     const NativeHead* head_ = nullptr;
     const float* window_R_ = nullptr;
-    int max_t_ = 0;
-    int device_ = -1;   ///< the device `load` ran on: the public calls switch to it (layer split)
-    int max_drafts_ = 1 << 30;
-    bool hnorm_stream_ = false;
-    bool q4_ = false, q4_head_ = false;
-    uint8_t* dense4_ = nullptr;              ///< --mtp-q4: Q4_0 copies of the Q8_0 tensors
-    std::vector<std::pair<std::string, uint64_t>> q4_off_;
-    int dhead_type_ = -1;                    ///< the draft head subset's ggml type (the main head's, or Q4_0)
-    std::string dvocab_path_;
-    std::string vocab_file() const { return dvocab_path_.empty() ? rt_dir_ + "/draft_vocab.bin" : dvocab_path_; }
-    /// a projection's weights for the draft layer's own pass: the Q4_0 copy under --mtp-q4, else the Q8_0 original
-    const void* wq(const char* name, int& type) const;
-    bool make_q4_dense(const std::vector<uint8_t>& blob, std::string& err);
-    bool make_q4_head(std::string& err);
-    void record_top2(int j);
-    std::vector<int32_t> top2_, dvocab_host_;
-    std::vector<float> lg_host_;
-    // --pipeline-windows 2 (chain_launch)
-    bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
-    bool force_on_ = false, chain_live_ = false;
-    const float* src_R_ = nullptr;
-    int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
-    cudaEvent_t ev_chain_ = nullptr;
-    cudaEvent_t ev_step_[8] = {};                       ///< after each of the first n_early outputs
-    int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
-    int32_t chain_tok_[8] = {};
-    float chain_prob_[8] = {};
+    int max_t_ = 0, max_drafts_ = 0;
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
-    cudaGraphExec_t prefill_exec_[9] = {};
-    cudaGraphExec_t prefill_dev_exec_[9] = {};
-    PinnedRing pf_ring_;          ///< #1996: the records above go up from a pinned slot, not from the pageable vector they are built in
-    int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
-    int64_t pf_cap_ = 0;          ///< its capacity in ints
-    cudaStream_t side_ = nullptr;                    // the shared expert's branch of the draft graphs (CUDA)
+    cudaStream_t side_ = nullptr;                    // the shared expert's branch of the draft graphs
     cudaEvent_t sh_fork_ = nullptr, sh_join_ = nullptr;
+    uint32_t* rseq_ = nullptr;                       // verify_router's sequence word and counter (device)
+    unsigned* rcount_ = nullptr;
     cudaGraphExec_t round_exec_[9] = {};
 
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
-    // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
-    bool owns_weights_ = true;
-    bool owns_draft_head_ = true;
+    uint64_t blob_ = 0;                               // bytes per expert
+    strata::kernels::NativeExpertLayout nat_;         // gu_type >= 0: GGUF blocks (experts.txt); else the Q2_0 blobs
     void* state_arena_ = nullptr;
     QsaState st_;
     void* arena_ = nullptr;
@@ -262,9 +195,6 @@ private:
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
     int64_t prompt_len_ = 0;
-    const int32_t* rr_res_ = nullptr;
-    float rr_margin_ = 0.0f;
-    int rr_lo_ = 6, rr_hi_ = 9;
     float* probs_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' and row_top_prob_split's partials and counters
     uint8_t* top_scratch_ = nullptr;
@@ -272,16 +202,13 @@ private:
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *row_ = nullptr, *ident_ = nullptr;
     float *Rin_ = nullptr, *R_ = nullptr, *emb_ = nullptr, *en_ = nullptr, *e2_ = nullptr, *hn_ = nullptr, *h2_ = nullptr;
     float *mixed_ = nullptr, *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *bo_ = nullptr;
-    float* xn_ = nullptr;
-    /// gr_read's scratch of the drafter's own (not the session's ss.block.gr: the last stage's verifier uses that one,
-    /// and with --pipeline-windows a chain and that stage's window can run on the card at once)
-    strata::kernels::GrWorkspace own_gr_;
+    float* grs_ = nullptr;   // the hyper-connection reads' scratch (zeroed with the arena)
     uint8_t* xq_ = nullptr;
-    float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr;
+    float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn32_ = nullptr;
     float* attn_scratch_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *y_ = nullptr, *sample_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr, *out_ids_ = nullptr;
-    uint8_t* hit_xq_ = nullptr;
+    uint8_t *hit_xq_ = nullptr, *nat_xq_ = nullptr;
     unsigned long long* grp_ptr_ = nullptr;
     int32_t *grp_start_ = nullptr, *grp_counts_ = nullptr;
     float* hit_xs_ = nullptr;

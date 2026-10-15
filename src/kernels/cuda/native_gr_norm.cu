@@ -45,12 +45,11 @@ __device__ __forceinline__ float norm_warp_sum(float value) {
 template<int BlockSize>
 __global__ void weighted_rms_norm(const float* __restrict__ input,
                                    const float* __restrict__ gamma,
-                                   float* __restrict__ output, int n_cols, float epsilon) {
+                                   float* __restrict__ output, int n_cols, int gamma_rows, float epsilon) {
     const int tid = threadIdx.x;
-    const std::size_t row = std::size_t(blockIdx.y) * gridDim.x + blockIdx.x;
-    const std::size_t row_offset = row * n_cols;
+    const std::size_t row_offset = std::size_t(blockIdx.x) * n_cols;
     input += row_offset;
-    gamma += std::size_t(blockIdx.x) * n_cols;
+    gamma += std::size_t(blockIdx.x % gamma_rows) * n_cols;
     output += row_offset;
     float partial = 0.0f;
     for (int col = tid; col < n_cols; col += BlockSize) {
@@ -85,22 +84,23 @@ void check_pointer(const void* p) {
 
 void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* output,
                                  int n_cols, int n_rows, float epsilon, void* stream) {
-    native_gr_rms_norm_weighted_multi(input, gamma, output, n_cols, n_rows, 1, epsilon, stream);
+    native_gr_rms_norm_weighted_repeat(input, gamma, output, n_cols, n_rows, n_rows, epsilon, stream);
 }
 
-void native_gr_rms_norm_weighted_multi(const float* input, const float* gamma, float* output,
-                                       int n_cols, int n_rows, int n_tok, float epsilon, void* stream) {
-    if (n_cols <= 0 || n_rows <= 0 || n_tok <= 0 || !std::isfinite(epsilon) || epsilon < 0.0f)
+void native_gr_rms_norm_weighted_repeat(const float* input, const float* gamma, float* output,
+                                        int n_cols, int n_rows, int gamma_rows, float epsilon, void* stream) {
+    if (n_cols <= 0 || n_rows <= 0 || gamma_rows <= 0 || !std::isfinite(epsilon) || epsilon < 0.0f)
         throw std::invalid_argument("native GR RMSNorm requires positive dimensions and finite nonnegative epsilon");
     check_pointer(input);
     check_pointer(gamma);
     check_pointer(output);
     const auto cuda_stream = static_cast<cudaStream_t>(stream);
-    const dim3 grid{unsigned(n_rows), unsigned(n_tok), 1u};
     if (n_cols < 1024)
-        weighted_rms_norm<256><<<grid, 256, 0, cuda_stream>>>(input, gamma, output, n_cols, epsilon);
+        weighted_rms_norm<256><<<unsigned(n_rows), 256, 0, cuda_stream>>>(input, gamma, output, n_cols, gamma_rows,
+                                                                           epsilon);
     else
-        weighted_rms_norm<1024><<<grid, 1024, 0, cuda_stream>>>(input, gamma, output, n_cols, epsilon);
+        weighted_rms_norm<1024><<<unsigned(n_rows), 1024, 0, cuda_stream>>>(input, gamma, output, n_cols, gamma_rows,
+                                                                             epsilon);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess)
         throw std::runtime_error(std::string("native GR RMSNorm launch: ") + cudaGetErrorString(error));

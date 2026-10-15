@@ -1,6 +1,5 @@
 #pragma once
 #include "strata/kernels/qsa.hpp"
-#include "strata/kernels/rope_scaling.hpp"
 
 namespace strata::kernels {
 
@@ -21,9 +20,6 @@ bool native_qsa_indexer_enabled();
 // contiguous, with nonnegative pos_base divisible by four. Clear state before
 // starting a new sequence. Completed block b rotates at pos_base+4*b; the spare
 // always rotates at zero, including nonzero sequence bases, as in the oracle.
-// Under rope scaling (rope_scaling.hpp) the zero angle keeps the spare's
-// rotation an identity; YaRN's mscale rides in through cos(0) on both the pooled
-// keys and the indexer queries, so selection is unchanged.
 //
 // Explicit nonnull stream; no allocation or synchronization. All spans must be
 // aligned and disjoint, remain valid through replay, and contain finite values;
@@ -36,18 +32,19 @@ bool native_qsa_indexer_enabled();
 // Host-side positions (not for a captured graph).
 void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, int32_t pos_base, const float* gamma,
                                      float epsilon, const QsaIndexerBuffers& b, const QsaShapes& s, int64_t max_cells,
-                                     const RopeScaling& scaling, void* stream);
+                                     float freq_base, void* stream);
 
 void native_qsa_indexer_append(const float* raw, const int32_t* relative_pos_device,
                                int32_t pos_base, const float* gamma, float epsilon,
                                const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
-                               int64_t max_cells, const RopeScaling& scaling, void* stream);
-
-void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_pos_device,
-                                     int pos_stride, int n_steps, int32_t pos_base,
-                                     const float* gamma, float epsilon,
+                               int64_t max_cells, float freq_base, void* stream);
+// n_tok appends in one launch, in order: token t's raw key at raw + t * 128, its position at
+// relative_pos_device[t * pos_stride].  Bitwise n_tok calls of native_qsa_indexer_append.  With `tail_snap`
+// (3 * 128 floats) the key tail as it was before them is copied there first.
+void native_qsa_indexer_append_multi(const float* raw, const int32_t* relative_pos_device, int pos_stride,
+                                     int n_tok, int32_t pos_base, const float* gamma, float epsilon,
                                      const QsaIndexerBuffers& buffers, const QsaShapes& shapes,
-                                     int64_t max_cells, const RopeScaling& scaling, void* stream);
+                                     int64_t max_cells, float freq_base, void* stream, float* tail_snap = nullptr);
 
 // engine-latency: the commit's append of the same window rows into several QSA layers in one launch.  Layer i reads
 // raw0 + i * raw_stride and its own gamma/buffers; with tail_src[i] set its tail is first restored from there (the
