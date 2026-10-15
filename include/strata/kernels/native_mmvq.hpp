@@ -4,7 +4,7 @@
 
 namespace strata::kernels {
 
-// Native GGUF Q2_0, Q4_0, Q5_0, Q8_0, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL
+// Native GGUF Q2_0, Q4_0, Q5_0, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL
 // and IQ4_XS / CUDA Q8_1 adapters, pinned to llama.cpp
 // 3cf03257f219afbe7334045ff7c6a06ac68c627d, sm_120 generic MMVQ.
 // All pointers are device pointers, at least 4-byte aligned, with no overlap.
@@ -31,6 +31,8 @@ std::size_t native_q8_1_bytes(int n_in, int ncols = 1);
 // graph capture; captured graphs keep the kernels they captured.
 void native_mmvq_set_multi_exact(bool exact);
 bool native_mmvq_multi_exact();
+// Rows per block (1, 2 or 4) for the exact ncols > 1 layout; every value keeps bitwise single-column equality.
+void native_mmvq_set_multi_rows(int rows);
 
 // One quantization may serve multiple weight matrices sharing the same input.
 // Q8_1 stores FP16 scale and FP16 warp sum of the ORIGINAL float inputs; it does

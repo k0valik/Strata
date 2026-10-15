@@ -10,13 +10,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include "strata/kernels/cpu/expert_observer.hpp"
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Scratch capacity includes GLM's 4096 values as Q8_K (16 x 292 bytes).
+inline constexpr size_t kNativeActBytes = 8192;
+/// Scratch capacity includes GLM's 2048 values as Q8_K (8 x 292 bytes).
+inline constexpr size_t kNativeHBytes = 4096;
+inline constexpr int kNativeFF = 2048;
 
 /// One layer's native expert geometry.
 struct NativeFmt {
@@ -27,11 +29,23 @@ struct NativeFmt {
     size_t up_off = 0, down_off = 0;    ///< inside the blob
     size_t bytes = 0;                   ///< the whole blob
     size_t act_bytes = 0, h_bytes = 0;  ///< quantized activation sizes (n_embd of gu_act, n_ff of d_act)
+<<<<<<< this fork
     /// NVFP4 (ggml type 40) only: the blob ends with {s_gate, s_up, s_down, 0} at this offset, the per-expert
     /// weight_scale_2 the block format has no room for (tools/iq_pack.py). 0 = no tail. Each scale goes on its own
     /// projection's FP32 output: gate * s_gate, up * s_up, down * s_down. Do not fold s_down into up: the hidden
     /// drops to ~1e-5 and its q8 block scale becomes an FP16 subnormal (expert error 2-12% instead of 1.1%).
     size_t tail_off = 0;
+=======
+    bool lossless = false;          ///< direct magnitude planes for IQ2_S/IQ3_S
+    int q23_layout = 0;             ///< 0: GGML rows; 1: tiled direct; 2: tiled lookup (Q2_K/Q3_K only)
+    ExpertObserver* observer = nullptr;
+    ExpertHiddenTransform* hidden_transform = nullptr;
+    int observer_layer = -1;
+    bool fuse_h_quant = false;
+    bool canon = false;               ///< canonical Q2_K/Q3_K arithmetic (canon_expert.hpp): the bits the GPU tier computes
+    float gate_skip = 0;              ///< canonical mode: units with |silu(gate)| below this contribute zero (lossy, opt-in)
+    float swiglu_limit = 0;           ///< 0 preserves the Qwen contract; GLM uses 10
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
 };
 constexpr int kNvfp4Type = 40;
 constexpr size_t kNvfp4Tail = 16;
@@ -45,15 +59,16 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
 void native_quant_act(const NativeFmt& f, const float* x, void* dst);
 /// h (n_ff floats) -> the down activation (h_bytes).
 void native_quant_h(const NativeFmt& f, const float* h, void* dst);
+void native_quant_h_rows(const NativeFmt& f,const float* h,void* dst,int first,int last);
 
 /// From how many tokens native_gu_rows gives this gate/up type to a multi-token kernel (#152; ggml-cpu's per-token dot
 /// below that).  1: a token's rows are the same alone and in any group.
 int native_gu_mt_min(int gu_type);
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]) for rows r in [r0, r1), `nt` tokens.
 void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt, float* const* ff,
-                    int r0, int r1);
+                    int r0, int r1, const uint8_t* separate_up = nullptr);
 /// out[t][r] = down_r . hq[t] for rows r in [r0, r1).
 void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt, float* const* out,
-                      int r0, int r1);
+                      int r0, int r1, const uint8_t* separate_down = nullptr);
 
 }  // namespace strata::kernels::cpu

@@ -25,9 +25,16 @@ void quantize_q8_1_rows(const float* x, int64_t n_rows, int64_t n_cols, void* y,
 /// y[c][r] = W[r] . x[c] for `ncols` columns of q8_1 activations (x stride n_in/32 blocks per column).
 void iq_mmvq(int ggml_type, const void* w, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream);
 
+<<<<<<< this fork
 /// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32; fp16 times `*scale` when given (device:
 /// an NVFP4 expert's s_down, read by the kernel itself so the source may be released right after it).
 void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale = nullptr);
+=======
+/// Dequantize `n` contiguous values (n a multiple of 256) to fp16 / fp32.
+void iq_dequant_f16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
+/// Direct FP32 dequantization rounded to BF16, without an intermediate FP16 image.
+void iq_dequant_bf16(int ggml_type, const void* src, int64_t n, uint16_t* dst, void* stream);
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
 void iq_dequant_f32(int ggml_type, const void* src, int64_t n, float* dst, void* stream);
 /// Rows `tokens[0..n_tok)` (device ids) of a GGUF embedding table (`row_bytes` per row; the table may be mapped
 /// host memory) dequantized to fp32, `n_embd` per row (a multiple of 256).
@@ -44,6 +51,8 @@ void iq_dequant_gu_f16(int ggml_type, const void* gate, const void* up, int64_t 
 struct NativeExpertLayout {
     int gu_type = -1, d_type = -1;
     int64_t n_embd = 0, n_ff = 0;
+    float swiglu_limit = 0;
+    float gate_skip = 0;                // canonical kernels only (glm_q23): see canon_expert.hpp
     size_t gu_row = 0, d_row = 0;       // bytes per row
     size_t up_off = 0, down_off = 0;    // byte offsets inside the blob
     size_t bytes = 0;                   // the whole blob
@@ -74,7 +83,7 @@ void iq_xmx_grouped(int ty, const uint8_t* const* a, const uint8_t* const* b, co
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups = 0);
+                           int64_t grid_groups = 0, int64_t batch_tokens = 1);
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
 /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.
