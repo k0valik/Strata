@@ -1,0 +1,174 @@
+"""Run one Q2 experiment with host memory limits and optional CPU interference rejection."""
+import argparse
+import json
+import os
+import pathlib
+import subprocess
+import time
+import signal
+import csv
+
+def gpu_compute_processes(index):
+    """CUDA clients, excluding the desktop's small compute context."""
+    value = subprocess.check_output(['nvidia-smi', '--id=' + str(index),
+        '--query-compute-apps=pid,process_name', '--format=csv,noheader'], text=True, timeout=3,
+        stderr=subprocess.STDOUT)
+    return [(int(pid.strip()), name.strip()) for pid, name in csv.reader(value.splitlines())
+            if pathlib.Path(name.strip()).name != 'gnome-remote-desktop-daemon']
+
+def gpu_free_mib(index):
+    value = subprocess.check_output(["nvidia-smi", "--id=" + str(index),
+        "--query-gpu=memory.free", "--format=csv,noheader,nounits"], text=True, timeout=3,
+        stderr=subprocess.STDOUT).strip()
+    free = int(value)
+    if free < 0:
+        raise ValueError("negative GPU free-memory reading")
+    return free
+
+def descendants(root):
+    """Include subprocesses (e.g. a resident engine launched by an evaluator)."""
+    parents = {}
+    for path in pathlib.Path("/proc").glob("[0-9]*/stat"):
+        try:
+            value = path.read_text()
+            fields = value[value.rindex(")") + 2:].split()
+            parents[int(path.parent.name)] = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            continue
+    found = {root}
+    while True:
+        expanded = found | {pid for pid, parent in parents.items() if parent in found}
+        if expanded == found:
+            return found
+        found = expanded
+
+def main():
+    from glm_q2_coding_bench import process_cpu_snapshot
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=pathlib.Path, required=True)
+    parser.add_argument("--require-idle", action="store_true")
+    parser.add_argument("--record-interference", action="store_true",
+                        help="record sustained external CPU work without aborting a functional or long run")
+    parser.add_argument("--max-swap-mib", type=int, default=0,
+                        help="tolerated process swap; keep 0 for timing runs, a small allowance only for quality runs")
+    parser.add_argument("--min-gpu-free-mib", type=int,
+                        help="reject when the selected NVIDIA GPU has less free memory; sampled once per second")
+    parser.add_argument("--gpu-index", type=int, default=0)
+    parser.add_argument("--require-gpu-idle", action="store_true",
+                        help="reject other CUDA compute clients before and during this run")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.gpu_index < 0 or args.min_gpu_free_mib is not None and args.min_gpu_free_mib < 0:
+        parser.error("GPU index and memory reserve must be nonnegative")
+    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    if not command:
+        parser.error("a command is required")
+    if args.require_gpu_idle:
+        clients = gpu_compute_processes(args.gpu_index)
+        if clients:
+            parser.error('GPU is in use by other CUDA clients: ' + repr(clients))
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    record = {"command": command, "peak_rss_kib": 0, "peak_swap_kib": 0, "minimum_available_kib": None,
+              "sample_interval_ms": 100, "rejected": None, "interference": []}
+    old = process_cpu_snapshot()
+    hot = set()
+    start = time.monotonic()
+    next_gpu_check = start
+    if args.min_gpu_free_mib is not None:
+        record["minimum_gpu_free_mib"] = None
+        record["required_gpu_free_mib"] = args.min_gpu_free_mib
+    with args.output.with_suffix(".stdout").open("w") as out, args.output.with_suffix(".log").open("w") as err:
+        process = subprocess.Popen(command, stdout=out, stderr=err, start_new_session=True)
+        try:
+            while process.poll() is None:
+                try:
+                    owned = descendants(process.pid)
+                    rss = swap = 0
+                    swapped_pids = []
+                    for pid in owned:
+                        try:
+                            fields = dict(line.split(":", 1) for line in pathlib.Path(f"/proc/{pid}/status").read_text().splitlines() if ":" in line)
+                        except FileNotFoundError:
+                            continue
+                        rss += int(fields.get("VmRSS", "0 kB").split()[0])
+                        swapped = int(fields.get("VmSwap", "0 kB").split()[0])
+                        swap += swapped
+                        if swapped:
+                            swapped_pids.append(pid)
+                    mem = dict(line.split(":", 1) for line in pathlib.Path("/proc/meminfo").read_text().splitlines())
+                    available = int(mem["MemAvailable"].split()[0])
+                    record["peak_rss_kib"] = max(record["peak_rss_kib"], rss)
+                    record["peak_swap_kib"] = max(record["peak_swap_kib"], swap)
+                    record["minimum_available_kib"] = min(record["minimum_available_kib"] or available, available)
+                    if (args.min_gpu_free_mib is not None or args.require_gpu_idle) and time.monotonic() >= next_gpu_check:
+                        next_gpu_check = time.monotonic() + 1
+                        try:
+                            if args.min_gpu_free_mib is not None:
+                                free = gpu_free_mib(args.gpu_index)
+                                previous = record["minimum_gpu_free_mib"]
+                                record["minimum_gpu_free_mib"] = free if previous is None else min(previous, free)
+                                if free < args.min_gpu_free_mib:
+                                    record["rejected"] = {"reason": "GPU memory reserve", "free_mib": free,
+                                                          "required_mib": args.min_gpu_free_mib}
+                            if args.require_gpu_idle:
+                                clients = [(pid, name) for pid, name in gpu_compute_processes(args.gpu_index) if pid not in owned]
+                                if clients:
+                                    record['rejected'] = dict(reason='external GPU work', clients=clients)
+                        except (OSError, ValueError, subprocess.SubprocessError) as error:
+                            record["rejected"] = {"reason": "GPU memory probe failed", "error": str(error)}
+                    if swap > args.max_swap_mib * 1024 or rss > 118 * 1024**2 or available < 4 * 1024**2:
+                        record["rejected"] = {"reason": "memory limit", "rss_kib": rss, "swap_kib": swap, "available_kib": available}
+                        if swap:
+                            swapped = []
+                            region = {}
+                            lines = []
+                            for pid in swapped_pids:
+                                try:
+                                    lines.extend(pathlib.Path(f"/proc/{pid}/smaps").read_text().splitlines())
+                                except FileNotFoundError:
+                                    pass
+                            for line in lines:
+                                if line[:1] and line.split()[0].count("-") == 1:
+                                    parts = line.split(maxsplit=5)
+                                    region = {"kind": "anonymous" if len(parts) < 6 else "heap" if parts[5] == "[heap]" else "stack" if parts[5].startswith("[stack") else "file"}
+                                elif line.startswith("Size:"):
+                                    region["size_kib"] = int(line.split()[1])
+                                elif line.startswith("Swap:") and int(line.split()[1]):
+                                    swapped.append({**region, "swap_kib": int(line.split()[1])})
+                            record["swapped_regions"] = swapped
+                    if (args.require_idle or args.record_interference) and time.monotonic() - old[0] >= 1:
+                        now = process_cpu_snapshot()
+                        busy = set()
+                        for pid, (name, ticks) in now[1].items():
+                            if pid in owned or pid in (os.getpid(), os.getppid()) or pid not in old[1]:
+                                continue
+                            percent = (ticks - old[1][pid][1]) / os.sysconf("SC_CLK_TCK") / (now[0] - old[0]) * 100
+                            if percent >= 80:
+                                busy.add(pid)
+                                if pid in hot:
+                                    event = {"reason": "external CPU work", "pid": pid, "name": name,
+                                             "cpu_percent": percent, "elapsed_seconds": time.monotonic() - start}
+                                    record["interference"].append(event)
+                                    if args.require_idle:
+                                        record["rejected"] = event
+                        old, hot = now, busy
+                    if record["rejected"]:
+                        os.killpg(process.pid, signal.SIGTERM)
+                        break
+                except (FileNotFoundError, ProcessLookupError):
+                    pass
+                time.sleep(.1)
+        finally:
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+            record["exit_code"] = process.wait()
+            record["wall_seconds"] = time.monotonic() - start
+            args.output.with_suffix(".memory.json").write_text(json.dumps(record, indent=2) + "\n")
+    print(json.dumps(record), flush=True)
+    return 2 if record["rejected"] else record["exit_code"]
+
+if __name__ == "__main__":
+    raise SystemExit(main())

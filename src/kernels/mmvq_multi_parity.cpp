@@ -56,6 +56,8 @@ struct Case {
 
 // the types a head or a projection can have in this model
 const Case CASES[] = {
+    {"Q2_0", 42, 8192, 513, 64, 18, {0, -1}},
+    {"Q3_K", 11, 4096, 515, 256, 110, {108, -1}},
     {"Q4_0", 2, 2048, 512, 32, 18, {0, -1}},          // Q40Block: half d
     {"Q8_0", 8, 2048, 512, 32, 34, {0, -1}},          // Q80Block: half d
     {"Q4_K", 12, 2048, 512, 256, 144, {0, 2}},        // Q4KBlock: half2 dm
@@ -63,7 +65,10 @@ const Case CASES[] = {
     {"Q6_K", 14, 2048, 512, 256, 210, {208, -1}},     // Q6KBlock: half d after ql, qh, scales
     {"IQ4_XS", 23, 4096, 512, 256, 136, {0, -1}},     // IQ4XSBlock: half d; n_in 4096, see THE NEGATIVE CONTROL
     {"Q5_K wide", 13, 4096, 2048, 256, 176, {0, 2}},
+    {"Q6_K wide", 14, 8192, 2049, 256, 210, {208, -1}},
 };
+int selected_rows = 1;
+bool benchmark = false;
 
 // a normal fp16 in +-[2^-10, 2^-5): exponent field 5..9 (bias 15), any mantissa, either sign
 uint16_t sane_half(std::mt19937& rng) {
@@ -83,7 +88,7 @@ bool ck(cudaError_t e, const char* what) {
 
 // Returns the number of outputs that differ bit for bit; counts the non-finite outputs and the differences on
 // outputs that are finite in both paths.
-long long compare(const Case& c, int T, cudaStream_t s, long long& nonfinite, long long& diff_finite, bool& ran) {
+long long compare(const Case& c, int T, cudaStream_t s, long long& nonfinite, long long& diff_finite, bool& ran, bool exact=true) {
     ran = false;
     if (!strata::kernels::native_mmvq_supported(c.type)) return -1;
 
@@ -135,9 +140,14 @@ long long compare(const Case& c, int T, cudaStream_t s, long long& nonfinite, lo
 
     try {
         strata::kernels::native_mmvq(c.type, dw, xq, dmulti, c.n_in, c.n_out, T, s);
+        // Always compare against the original single-row launch, including T=1.
+        strata::kernels::native_mmvq_set_multi_rows(1);
+        strata::kernels::native_mmvq_set_multi_exact(false);
         for (int j = 0; j < T; ++j)
             strata::kernels::native_mmvq(c.type, dw, (const uint8_t*) xq + (std::size_t) j * qcol,
                                          dsingle + (std::size_t) j * c.n_out, c.n_in, c.n_out, 1, s);
+        strata::kernels::native_mmvq_set_multi_rows(selected_rows);
+        strata::kernels::native_mmvq_set_multi_exact(exact);
     } catch (const std::exception& e) {
         std::printf("%-12s T=%d: %s\n", c.name, T, e.what());
         return -1;
@@ -162,6 +172,21 @@ long long compare(const Case& c, int T, cudaStream_t s, long long& nonfinite, lo
             ++diff;
             if (both_finite) ++diff_finite;
         }
+    }
+    if (benchmark) {
+        cudaEvent_t start{}, stop{};
+        if (!ck(cudaEventCreate(&start), "bench event") || !ck(cudaEventCreate(&stop), "bench event")) return -1;
+        for (int i = 0; i < 10; ++i)
+            strata::kernels::native_mmvq(c.type, dw, xq, dmulti, c.n_in, c.n_out, T, s);
+        if (!ck(cudaEventRecord(start, s), "bench start")) return -1;
+        for (int i = 0; i < 200; ++i)
+            strata::kernels::native_mmvq(c.type, dw, xq, dmulti, c.n_in, c.n_out, T, s);
+        if (!ck(cudaEventRecord(stop, s), "bench stop") || !ck(cudaEventSynchronize(stop), "bench wait")) return -1;
+        float ms = 0;
+        if (!ck(cudaEventElapsedTime(&ms, start, stop), "bench elapsed")) return -1;
+        std::printf("DENSE_BENCH type=%d in=%d out=%d tokens=%d rows=%d ms=%.6f diff=%lld nonfinite=%lld\n",
+                    c.type, c.n_in, c.n_out, T, selected_rows, ms / 200, diff, nonfinite);
+        cudaEventDestroy(start); cudaEventDestroy(stop);
     }
     cudaFree(dw); cudaFree(xq); cudaFree(dx); cudaFree(dmulti); cudaFree(dsingle);
     ran = true;
@@ -188,7 +213,7 @@ int sweep(bool exact, cudaStream_t s, Totals& t) {
         for (int T : WIDTHS) {
             long long nf = 0, dfin = 0;
             bool ran = false;
-            const long long diff = compare(c, T, s, nf, dfin, ran);
+            const long long diff = compare(c, T, s, nf, dfin, ran, exact);
             if (!ran) { ++bad; continue; }
             const long long n = (long long) T * c.n_out;
             t.checked += n;
@@ -213,6 +238,25 @@ int sweep(bool exact, cudaStream_t s, Totals& t) {
 int main() {
     cudaStream_t s;
     if (!ck(cudaStreamCreate(&s), "stream create")) return 1;
+    // STRATA_MMVQ_MULTI_ROWS=2|4 checks the multi-row exact layout against single-column calls.
+    if (const char* rows = std::getenv("STRATA_MMVQ_MULTI_ROWS")) {
+        selected_rows = std::atoi(rows);
+        strata::kernels::native_mmvq_set_multi_rows(selected_rows);
+        std::printf("exact layout rows per block: %s\n", rows);
+    }
+    if (std::getenv("STRATA_MMVQ_BENCH")) {
+        benchmark = true;
+        int bad = 0;
+        for (const Case& c : {Case{"Q5_K projection", 13, 4096, 16384, 256, 176, {0, 2}},
+                              Case{"Q6_K projection", 14, 4096, 16384, 256, 210, {208, -1}}})
+            for (int T : {1, 2, 3}) {
+                long long nf = 0, finite = 0; bool ran = false;
+                const auto diff = compare(c, T, s, nf, finite, ran);
+                if (!ran || diff || nf) ++bad;
+            }
+        cudaStreamDestroy(s);
+        return bad ? 1 : 0;
+    }
 
     Totals on, off;
     const int bad = sweep(true, s, on);

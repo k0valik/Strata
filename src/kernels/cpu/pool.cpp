@@ -1,5 +1,7 @@
 // src/kernels/cpu/pool.cpp - P2.S3: the CPU expert pool.  Read pool.hpp first; it explains the protocol.
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/canon_expert.hpp"
+#include <stdexcept>
 #include "strata/core/progress.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -15,6 +17,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <stdexcept>
 
 #if defined(_WIN32)
@@ -24,6 +27,10 @@
 #else
 #include <pthread.h>
 #include <sched.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #include "pool_affinity_linux.hpp"
 #endif
 
@@ -475,6 +482,39 @@ void ExpertPool::diag(std::FILE* f) const {
 ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
     : tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
+    if (const char* e = std::getenv("STRATA_NATIVE_NUMA_LOCAL")) {
+        if (std::string(e) != "0" && std::string(e) != "1")
+            throw std::invalid_argument("STRATA_NATIVE_NUMA_LOCAL must be 0 or 1");
+#if defined(__linux__)
+        native_local_enabled_ = *e == '1' && access("/sys/devices/system/node/node1", F_OK) == 0 &&
+                                access("/sys/devices/system/node/node2", F_OK) != 0;
+        if (native_local_enabled_) {
+            cpu_nodes_.assign(CPU_SETSIZE, -1);
+            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+                for (int node = 0; node < 2; ++node) {
+                    char path[96];
+                    std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/node%d", cpu, node);
+                    if (access(path, F_OK) == 0) cpu_nodes_[cpu] = node;
+                }
+        }
+#endif
+    }
+#if defined(__linux__)
+    if(access("/sys/devices/system/node/node1",F_OK)==0 && access("/sys/devices/system/node/node2",F_OK)!=0 && cpu_nodes_.empty()) {
+        cpu_nodes_.assign(CPU_SETSIZE,-1);
+        for(int cpu=0;cpu<CPU_SETSIZE;++cpu)for(int node=0;node<2;++node) {
+            char path[96];std::snprintf(path,sizeof(path),"/sys/devices/system/cpu/cpu%d/node%d",cpu,node);
+            if(access(path,F_OK)==0)cpu_nodes_[cpu]=node;
+        }
+    }
+#endif
+    if (const char* e = std::getenv("STRATA_NATIVE_TASKS_PER_THREAD")) {
+        char* end = nullptr;
+        const long value = std::strtol(e, &end, 10);
+        if (end == e || *end || value < 1 || value > 16)
+            throw std::invalid_argument("STRATA_NATIVE_TASKS_PER_THREAD must be 1..16");
+        native_tasks_per_thread_ = (int) value;
+    }
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
     if (n_workers > 0) {
@@ -485,6 +525,13 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
         n_ = (int) topo_.worker_cores.size();
     }
     if (n_ < 1) n_ = 1;
+    if(pin && !cpu_nodes_.empty()) {
+        for(int i=0;i<n_ && i<int(topo_.worker_cores.size());++i) {
+            int core=topo_.worker_cores[i],node=cpu_nodes_[core];
+            if(node>=0 && node<2 && numa_cores_[node]<0)numa_cores_[node]=core;
+        }
+        numa_rows_available_=numa_cores_[0]>=0 && numa_cores_[1]>=0;
+    }
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
@@ -593,8 +640,28 @@ void ExpertPool::worker(int id) {
     }
 }
 
-int ExpertPool::claim(uint32_t epoch) {
+int ExpertPool::claim(uint32_t epoch, int node) {
     uint64_t h = head_.load(std::memory_order_acquire);
+    if ((uint32_t)(h >> 32) != epoch) return -1;
+    if (native_local_phase_) {
+        node = node == 1 ? 1 : 0;
+        for(int pass=0;pass<(native_owned_phase_?1:2);++pass) {
+            int q=node^pass;auto& cursor=q?local_next1_:local_next0_;
+            uint64_t local=cursor.load(std::memory_order_acquire);
+            for(;;) {
+                if(uint32_t(local>>32)!=epoch)break;
+                uint32_t count=uint32_t(local>>16)&0xffffu,index=uint32_t(local)&0xffffu;
+                if(index>=count)break;
+                if(cursor.compare_exchange_weak(local,local+1,std::memory_order_acq_rel,std::memory_order_acquire)) {
+                    // A successful epoch-tagged claim owns an unfinished job,
+                    // so the host cannot replace this queue until it completes.
+                    head_.fetch_add(1,std::memory_order_relaxed);
+                    return local_tasks_[q][index];
+                }
+            }
+        }
+        return -1;
+    }
     for (;;) {
         if ((uint32_t) (h >> 32) != epoch) return -1;               // not the batch this thread woke for
         const uint32_t n = (uint32_t) (h >> 16) & 0xffffu, i = (uint32_t) h & 0xffffu;
@@ -622,13 +689,12 @@ void ExpertPool::wait_parked(const char* what) {
     hstate_.store(kWaitParked, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
     uint32_t spins = 0;
-    std::chrono::steady_clock::time_point t0{};
+    auto t0=std::chrono::steady_clock::now();
     while (parked_.load(std::memory_order_acquire) != (uint32_t) n_) {
         _mm_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
-        if (spins == 1024u) t0 = now;
-        else if (now - t0 > kStall) {
+        if (now - t0 > kStall) {
             std::fprintf(stderr, "strata: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
                                  "so the server can start it again (issue #29)\n",
                          what, parked_.load(), n_);
@@ -643,14 +709,14 @@ void ExpertPool::wait_done(int n) {
     hstate_.store(kWaitDone, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
     uint32_t spins = 0, seen = 0;
-    std::chrono::steady_clock::time_point t0{};
+    auto t0=std::chrono::steady_clock::now();
     for (;;) {
         const uint32_t d = done_.load(std::memory_order_acquire);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
         _mm_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
-        if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
+        if (d != seen) { t0 = now; seen = d; }     // progress restarts the clock
         else if (now - t0 > kStall) {
             std::fprintf(stderr, "strata: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
                                  "stopping the engine so the server can start it again (issue #29)\n",
@@ -664,8 +730,15 @@ void ExpertPool::wait_done(int n) {
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     (void) id;
+    int node = -1;
+#if defined(__linux__)
+    if (native_local_phase_) {
+        const int cpu = sched_getcpu();
+        if (cpu >= 0 && cpu < (int)cpu_nodes_.size()) node = cpu_nodes_[cpu];
+    }
+#endif
     for (;;) {
-        const int ci = claim(epoch);
+        const int ci = claim(epoch, node);
         if (ci < 0) break;
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
@@ -681,10 +754,44 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
+        } else if (mode_ == 8) {
+            flow_task((int) i);
+        } else if (mode_ == 7) {
+            const int first=mrows_*i/mtasks_,last=mrows_*(i+1)/mtasks_;
+            if(reduce_canon_) {
+                for(int token=first/reduce_hidden_;token*reduce_hidden_<last;++token) {
+                    const int r0=std::max(first-token*reduce_hidden_,0),r1=std::min(last-token*reduce_hidden_,reduce_hidden_);
+                    canon_route_sum(reduce_results_+size_t(token)*reduce_experts_*reduce_hidden_,reduce_weights_+token*reduce_experts_,
+                                    reduce_output_+size_t(token)*reduce_hidden_,reduce_experts_,reduce_hidden_,r0,r1);
+                }
+            } else
+            for(int r=first;r<last;++r){const int token=r/reduce_hidden_,row=r%reduce_hidden_;float sum=0;
+                for(int k=0;k<reduce_experts_;++k){const int j=token*reduce_experts_+k;sum+=reduce_weights_[j]*reduce_results_[size_t(j)*reduce_hidden_+row];}reduce_output_[r]=sum;}
         } else if (mode_ >= 5) {
+<<<<<<< this fork
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows (the layer's own n_ff / n_embd: Flash-Next's
             // FF / H, or another family's smaller expert)
             const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
+=======
+            // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows
+            if(native_owned_phase_) {
+                const int e=i/(2*native_owned_parts_),node=(i/native_owned_parts_)%2,part=i%native_owned_parts_;
+                const int half=(mode_==5?nfmt_->n_ff:nfmt_->n_embd)/2;
+                const int r0=half*part/native_owned_parts_,r1=half*(part+1)/native_owned_parts_;
+                const auto& j=mjobs_[e];float* output[MAXT];const void* act[MAXT];
+                for(int t=0;t<j.nt;++t) {
+                    output[t]=(mode_==5?split_multi_[e].ff[t]:j.out[t])+node*half;
+                    act[t]=mode_==5?j.nact[t]:split_multi_[e].hq[t];
+                }
+                if(mode_==5) {
+                    native_gu_rows(*nfmt_,j.numa[node].gate,act,j.nt,output,r0,r1,j.numa[node].up);
+                    if(nfmt_->fuse_h_quant)for(int t=0;t<j.nt;++t)native_quant_h_rows(*nfmt_,split_multi_[e].ff[t],split_multi_[e].hq[t],node*half+r0,node*half+r1);
+                }
+                else native_down_rows(*nfmt_,j.numa[node].gate,act,j.nt,output,r0,r1,j.numa[node].down);
+                done_.fetch_add(1,std::memory_order_release);continue;
+            }
+            const int per = (int) (mode_ == 5 ? nfmt_->n_ff : nfmt_->n_embd);
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
             const int64_t g0 = mrows_ * (int64_t) i / mtasks_, g1 = mrows_ * (int64_t) (i + 1) / mtasks_;
             for (int64_t r = g0; r < g1;) {
                 const int e = (int) (r / per), r0 = (int) (r % per);
@@ -692,7 +799,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 SplitBufMulti& sb = split_multi_[(size_t) e];
                 if (mode_ == 5 && q2_native_kernels(nfmt_->gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+                    thread_local float gbuf[MAXT][kNativeFF], ubuf[MAXT][kNativeFF];
                     float* gp[MAXT];
                     float* up[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
@@ -705,7 +812,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    native_gu_rows(*nfmt_, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1, mjobs_[e].native_up);
                 } else if (q2_native_kernels(nfmt_->d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
@@ -715,7 +822,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 } else {
                     const void* hq[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    native_down_rows(*nfmt_, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1, mjobs_[e].native_down);
                 }
                 r += r1 - r0;
             }
@@ -743,10 +850,80 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     }
 }
 
+void ExpertPool::prepare_native_local_tasks(int n_tasks) {
+    native_local_phase_ = false;
+#if defined(__linux__) && defined(SYS_move_pages)
+    if(native_owned_phase_) {
+        local_tasks_[0].clear();local_tasks_[1].clear();
+        for(int i=0;i<n_tasks;++i)local_tasks_[(i/native_owned_parts_)%2].push_back(i);
+        uint32_t next_epoch=epoch_.load(std::memory_order_relaxed)+1;
+        local_next0_.store(pack_head(next_epoch,local_tasks_[0].size(),0),std::memory_order_release);
+        local_next1_.store(pack_head(next_epoch,local_tasks_[1].size(),0),std::memory_order_release);
+        native_local_phase_=true;return;
+    }
+    if (!native_local_enabled_ || mode_ != 6) return;
+    std::vector<void*> pages;
+    std::vector<int> task_ids;
+    const size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+    const int per = (int)nfmt_->n_embd;
+    for (int task = 0; task < n_tasks; ++task) {
+        const int64_t begin = mrows_ * task / mtasks_, end = mrows_ * (task + 1) / mtasks_;
+        for (int64_t row = begin; row < end;) {
+            const int expert = (int)(row / per), r0 = (int)(row % per);
+            const int r1 = (int)std::min<int64_t>(per, r0 + end - row);
+            const auto& job = mjobs_[expert];
+            const uint8_t* weights = job.native_down ? job.native_down : job.blob + nfmt_->down_off;
+            for (int r : {r0, (r0 + r1 - 1) / 2, r1 - 1}) {
+                const uintptr_t address = (uintptr_t)(weights + (size_t)r * nfmt_->d_row);
+                pages.push_back((void*)(address / page_size * page_size));
+                task_ids.push_back(task);
+            }
+            row += r1 - r0;
+        }
+    }
+    std::vector<int> status(pages.size()), votes0(n_tasks), votes1(n_tasks);
+    // NULL targets and flags 0 query placement; this never requests migration.
+    if (syscall(SYS_move_pages, 0, pages.size(), pages.data(), nullptr, status.data(), 0) < 0) {
+        if (!native_local_reported_)
+            std::fprintf(stderr, "NATIVE_NUMA query_failed errno=%d fallback=global\n", errno);
+        native_local_reported_ = true;
+        return;
+    }
+    for (size_t i = 0; i < status.size(); ++i) {
+        if (status[i] == 0) ++votes0[task_ids[i]];
+        if (status[i] == 1) ++votes1[task_ids[i]];
+    }
+    local_tasks_[0].clear();
+    local_tasks_[1].clear();
+    for (int task = 0; task < n_tasks; ++task) {
+        const int node = votes0[task] == votes1[task] ? task % 2 : votes1[task] > votes0[task];
+        local_tasks_[node].push_back(task);
+    }
+    uint32_t next_epoch=epoch_.load(std::memory_order_relaxed)+1;
+    local_next0_.store(pack_head(next_epoch,local_tasks_[0].size(),0),std::memory_order_release);
+    local_next1_.store(pack_head(next_epoch,local_tasks_[1].size(),0),std::memory_order_release);
+    native_local_phase_ = true;
+    if (!native_local_reported_) {
+        int known = 0;
+        for (int value : status) known += value == 0 || value == 1;
+        std::fprintf(stderr, "NATIVE_NUMA phase=down tasks0=%zu tasks1=%zu known_pages=%d total_pages=%zu query_only=1\n",
+                     local_tasks_[0].size(), local_tasks_[1].size(), known, pages.size());
+        native_local_reported_ = true;
+    }
+#endif
+}
+
 void ExpertPool::run_phase(int mode, int n_tasks) {
     wait_parked("before a phase");
     mode_ = mode;
     njobs_ = n_tasks;
+    if (native_local_enabled_ && mode == 6) {
+        const auto start = std::chrono::steady_clock::now();
+        prepare_native_local_tasks(n_tasks);
+        ms_native_local_prepare += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+        ++native_local_queries;
+    } else prepare_native_local_tasks(n_tasks);
     const uint32_t e = begin_batch(n_tasks);
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
@@ -816,24 +993,57 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n) {
     if (n <= 0) return;
+    if (f.n_ff <= 0 || f.n_ff > kNativeFF || f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes ||
+        ((f.gu_type == 42 || f.d_type == 42) && (f.n_embd != H || f.n_ff != FF || f.swiglu_limit != 0)))
+        throw std::invalid_argument("native expert pool: unsupported scratch geometry or Q2_0 contract");
+    for (int i = 0; i < n; ++i)
+        if (jobs[i].nt < 1 || jobs[i].nt > MAXT)
+            throw std::invalid_argument("native expert pool: invalid token count");
+    const bool owned=jobs[0].numa[0].gate!=nullptr;
+    if(f.fuse_h_quant && (!owned||f.observer||f.hidden_transform||f.n_ff%512||f.d_type==42))throw std::invalid_argument("fused hidden quantization requires owned 256-row chunks without observation or transformation");
+    if(owned && (!numa_rows_available_ || f.gu_type==42 || f.d_type==42 || f.n_ff%2 || f.n_embd%2))
+        throw std::invalid_argument("native NUMA rows require pinned workers on both nodes and native IQ geometry");
+    for(int e=0;e<n;++e)for(int node=0;node<2;++node) {
+        const auto& row=jobs[e].numa[node];
+        if(owned?(!row.gate||!row.up||!row.down):(row.gate||row.up||row.down))
+            throw std::invalid_argument("native NUMA row batch must have complete, consistent shards");
+    }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
         nfmt_ = &f;
+<<<<<<< this fork
         mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = phase_tasks(mrows_);
+=======
+        const int threads = n_ + (host_works_ ? 1 : 0);
+        native_owned_phase_=owned;
+        const int gu_target = tasks_ ? phase_tasks(int64_t(nb) * f.n_ff) : native_tasks_per_thread_ * threads;
+        native_owned_parts_=f.fuse_h_quant?f.n_ff/512:std::max(1,(gu_target+2*nb-1)/(2*nb));
+        mtasks_ = owned?2*nb*native_owned_parts_:gu_target;
+        mrows_ = (int64_t) nb * f.n_ff;
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
-        for (int e = 0; e < nb; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
+        if(!f.fuse_h_quant)for (int e = 0; e < nb; ++e)
+            for (int t = 0; t < mjobs_[e].nt; ++t) {
+                if(f.observer)f.observer->hidden(f.observer_layer,mjobs_[e].expert_id,split_multi_[(size_t)e].ff[t],f.n_ff);
+                if(f.hidden_transform)f.hidden_transform->apply(f.observer_layer,mjobs_[e].expert_id,t,split_multi_[(size_t)e].ff[t],f.n_ff);
                 if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
                 else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+            }
         const auto c = std::chrono::steady_clock::now();
+<<<<<<< this fork
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = phase_tasks(mrows_);
+=======
+        const int down_target = tasks_ ? phase_tasks(int64_t(nb) * f.n_embd) : native_tasks_per_thread_ * threads;
+        if(f.fuse_h_quant || tasks_){native_owned_parts_=std::max(1,(down_target+2*nb-1)/(2*nb));mtasks_=owned?2*nb*native_owned_parts_:down_target;}
+        mrows_ = (int64_t) nb * f.n_embd;
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
         run_phase(6, mtasks_);
         const auto d = std::chrono::steady_clock::now();
         ms_multi_gu += std::chrono::duration<double, std::milli>(b - a).count();
@@ -841,8 +1051,246 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         ms_multi_down += std::chrono::duration<double, std::milli>(d - c).count();
     }
     multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    native_owned_phase_=false;native_local_phase_=false;
     mode_ = 0;
     ms_drain_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
+void ExpertPool::flow_task(int i) {
+    const NativeFmt& f = *nfmt_;
+    const int sides = flow_owned_ ? 2 : 1;
+    if (i < flow_gu_tasks_) {
+        const int parts = flow_gu_parts_, e = i / (sides * parts), node = flow_owned_ ? (i / parts) % 2 : 0;
+        const int part = i % parts;
+        const ExpertJobMulti& j = mjobs_[e];
+        SplitBufMulti& sb = split_multi_[(size_t) e];
+        float* ff[MAXT];
+        if (flow_owned_) {
+            const int half = (int) f.n_ff / 2, r0 = half * part / parts, r1 = half * (part + 1) / parts;
+            for (int t = 0; t < j.nt; ++t) ff[t] = sb.ff[t] + node * half;
+            native_gu_rows(f, j.numa[node].gate, j.nact, j.nt, ff, r0, r1, j.numa[node].up);
+            if (f.fuse_h_quant)
+                for (int t = 0; t < j.nt; ++t) native_quant_h_rows(f, sb.ff[t], sb.hq[t], node * half + r0, node * half + r1);
+        } else {
+            const int r0 = (int) f.n_ff * part / parts, r1 = (int) f.n_ff * (part + 1) / parts;
+            for (int t = 0; t < j.nt; ++t) ff[t] = sb.ff[t];
+            native_gu_rows(f, j.blob, j.nact, j.nt, ff, r0, r1, j.native_up);
+        }
+        // acq_rel: the last part sees every other part's rows before it quantizes and publishes them.
+        if (flow_experts_[e].left.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            if (!f.fuse_h_quant)
+                for (int t = 0; t < j.nt; ++t) native_quant_h(f, sb.ff[t], sb.hq[t]);
+            flow_experts_[e].ready.store(flow_tag_, std::memory_order_release);
+        }
+        return;
+    }
+    // Each expert's gate/up parts precede its down parts in both node queues.
+    const int d = i - flow_gu_tasks_, parts = flow_down_parts_, e = d / (sides * parts);
+    const int node = flow_owned_ ? (d / parts) % 2 : 0, part = d % parts;
+    // A gate/up part that never completes (a bug, not a slow row) stops the engine like the pool's other
+    // waits, instead of spinning forever.
+    for (uint32_t spins = 0; flow_experts_[e].ready.load(std::memory_order_acquire) != flow_tag_; ++spins) {
+        _mm_pause();
+        if ((spins & 0xfffffu) != 0xfffffu) continue;
+        static thread_local auto since = std::chrono::steady_clock::now();
+        if (spins == 0xfffffu) since = std::chrono::steady_clock::now();
+        else if (std::chrono::steady_clock::now() - since > kStall) {
+            std::fprintf(stderr, "strata: the layer dataflow waited %lld s for expert %d's gate/up rows - stopping the "
+                                 "engine so the server can start it again\n", (long long) kStall.count(), e);
+            strata::core::release_gpu_waits(stderr);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+    const ExpertJobMulti& j = mjobs_[e];
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    const void* hq[MAXT];
+    float* out[MAXT];
+    for (int t = 0; t < j.nt; ++t) hq[t] = sb.hq[t];
+    int first, last, chunk;
+    if (flow_owned_) {
+        const int half = (int) f.n_embd / 2, r0 = half * part / parts, r1 = half * (part + 1) / parts;
+        for (int t = 0; t < j.nt; ++t) out[t] = j.out[t] + node * half;
+        native_down_rows(f, j.numa[node].gate, hq, j.nt, out, r0, r1, j.numa[node].down);
+        first = node * half + r0; last = node * half + r1; chunk = node * parts + part;
+    } else {
+        first = (int) f.n_embd * part / parts; last = (int) f.n_embd * (part + 1) / parts; chunk = part;
+        for (int t = 0; t < j.nt; ++t) out[t] = j.out[t];
+        native_down_rows(f, j.blob, hq, j.nt, out, first, last, j.native_down);
+    }
+    const auto *groups = flow_experts_[0].groups;
+    if (groups) {
+        const unsigned mask = flow_experts_[e].group_mask;
+        const int hidden = (int)f.n_embd;
+        for (int group = 0; group < 2; ++group) {
+            if (!(mask & (1u << group)) ||
+                flow_chunks_[chunk].group_left[group].fetch_sub(1, std::memory_order_acq_rel) != 1) continue;
+            const int begin = group ? groups->split : 0, end = group ? flow_tokens_ : groups->split;
+            for (int t = begin; t < end; ++t)
+                canon_route_sum(flow_results_ + (size_t)t * flow_k_ * hidden, flow_weights_ + t * flow_k_,
+                                groups->sum[group] + (size_t)(t - begin) * hidden, flow_k_, hidden, first, last);
+            // The final chunk sees every sum store before publishing the group.
+            if (flow_experts_[0].group_chunks[group].fetch_sub(1, std::memory_order_acq_rel) == 1)
+                groups->complete(groups->context, group);
+        }
+        return;
+    }
+    if (flow_chunks_[chunk].left.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
+    // The last expert through this chunk writes its routed sum in reduce_routed's order.
+    const int hidden = (int) f.n_embd;
+    if (f.canon) {
+        for (int t = 0; t < flow_tokens_; ++t)
+            canon_route_sum(flow_results_ + (size_t) t * flow_k_ * hidden, flow_weights_ + t * flow_k_,
+                            flow_sum_ + (size_t) t * hidden, flow_k_, hidden, first, last);
+        return;
+    }
+    for (int t = 0; t < flow_tokens_; ++t) {
+        for (int r = first; r < last; ++r) {
+            float sum = 0;
+            for (int k = 0; k < flow_k_; ++k) {
+                const int route = t * flow_k_ + k;
+                sum += flow_weights_[route] * flow_results_[(size_t) route * hidden + r];
+            }
+            flow_sum_[(size_t) t * hidden + r] = sum;
+        }
+    }
+}
+
+void ExpertPool::run_layer_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, const float* results,
+                                  const float* weights, float* sum, int nt, int top_k) {
+    run_layer_native_impl(f, jobs, n, results, weights, sum, nullptr, nt, top_k);
+}
+void ExpertPool::run_layer_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, const float* results,
+                                  const float* weights, const LayerGroups& groups, int nt, int top_k) {
+    if (!f.canon || groups.split < 1 || groups.split >= nt || !groups.sum[0] || !groups.sum[1] || !groups.complete)
+        throw std::invalid_argument("layer groups: canonical rows, two sums and a completion callback required");
+    run_layer_native_impl(f, jobs, n, results, weights, groups.sum[0], &groups, nt, top_k);
+}
+void ExpertPool::run_layer_native_impl(const NativeFmt& f, ExpertJobMulti* jobs, int n, const float* results,
+                                       const float* weights, float* sum, const LayerGroups* groups, int nt, int top_k) {
+    if (nt < 1 || nt > MAXT || top_k < 1 || top_k > 32 || !results || !weights || !sum)
+        throw std::invalid_argument("layer dataflow: invalid routed geometry");
+    const bool owned = n > 0 && jobs[0].numa[0].gate != nullptr;
+    // Paths this scheduler does not cover keep the phased execution.
+    if (n <= 0 || n > kMaxSplitMulti || n_ == 1 || f.observer || f.hidden_transform || f.gu_type == 42 || f.d_type == 42 ||
+        native_local_enabled_ || (owned && !numa_rows_available_)) {
+        if (n > 0) run_split_multi_native(f, jobs, n);
+        if (groups) {
+            for (int group = 0; group < 2; ++group) {
+                const int begin = group ? groups->split : 0, end = group ? nt : groups->split;
+                for (int t = begin; t < end; ++t)
+                    canon_route_sum(results + (size_t)t * top_k * f.n_embd, weights + t * top_k,
+                                    groups->sum[group] + (size_t)(t - begin) * f.n_embd, top_k, f.n_embd, 0, f.n_embd);
+                groups->complete(groups->context, group);
+            }
+        } else reduce_routed(results, weights, sum, nt, top_k, (int) f.n_embd, f.canon);
+        return;
+    }
+    if (f.n_ff <= 0 || f.n_ff > kNativeFF || f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes)
+        throw std::invalid_argument("layer dataflow: unsupported scratch geometry");
+    for (int i = 0; i < n; ++i) {
+        if (jobs[i].nt < 1 || jobs[i].nt > MAXT) throw std::invalid_argument("layer dataflow: invalid token count");
+        for (int node = 0; node < 2; ++node) {
+            const auto& row = jobs[i].numa[node];
+            if (owned ? (!row.gate || !row.up || !row.down) : (row.gate || row.up || row.down))
+                throw std::invalid_argument("layer dataflow: incomplete or mixed NUMA shards");
+        }
+    }
+    if (f.fuse_h_quant && (!owned || f.n_ff % 512))
+        throw std::invalid_argument("layer dataflow: fused hidden quantization requires owned 256-row chunks");
+    const auto t0 = std::chrono::steady_clock::now();
+    wait_parked("before a layer");
+    const int threads = n_ + (host_works_ ? 1 : 0), sides = owned ? 2 : 1;
+    const int target = native_tasks_per_thread_ * threads;
+    flow_gu_parts_ = owned && f.fuse_h_quant ? (int) f.n_ff / 512 : std::max(1, (target + sides * n - 1) / (sides * n));
+    flow_down_parts_ = std::max(1, (target + sides * n - 1) / (sides * n));
+    flow_gu_tasks_ = n * sides * flow_gu_parts_;
+    const int total = flow_gu_tasks_ + n * sides * flow_down_parts_, chunks = sides * flow_down_parts_;
+    if (total > 0xffff) throw std::invalid_argument("layer dataflow: too many tasks");
+    if (!flow_experts_) flow_experts_ = std::make_unique<FlowCounter[]>(kMaxSplitMulti);
+    if ((size_t) chunks > flow_chunk_capacity_) {
+        flow_chunks_ = std::make_unique<FlowCounter[]>(chunks);
+        flow_chunk_capacity_ = chunks;
+    }
+    int group_jobs[2]{};
+    for (int e = 0; e < n; ++e) {
+        flow_experts_[e].left.store(sides * flow_gu_parts_, std::memory_order_relaxed);
+        unsigned mask = 0;
+        if (groups)
+            for (int t = 0; t < jobs[e].nt; ++t) {
+                const auto base = reinterpret_cast<uintptr_t>(results), ptr = reinterpret_cast<uintptr_t>(jobs[e].out[t]);
+                const size_t row = (size_t)f.n_embd * sizeof(float), bytes = (size_t)nt * top_k * row;
+                if (ptr < base || ptr - base >= bytes || (ptr - base) % row)
+                    throw std::invalid_argument("layer groups: each job output must be a routed row");
+                mask |= 1u << ((ptr - base) / row / top_k >= (size_t)groups->split);
+            }
+        flow_experts_[e].group_mask = mask;
+        for (int g = 0; g < 2; ++g) group_jobs[g] += bool(mask & (1u << g));
+    }
+    flow_experts_[0].groups = groups;
+    for (int g = 0; g < 2; ++g) flow_experts_[0].group_chunks[g].store(group_jobs[g] ? chunks : 0, std::memory_order_relaxed);
+    for (int c = 0; c < chunks; ++c) {
+        flow_chunks_[c].left.store(n, std::memory_order_relaxed);
+        for (int g = 0; g < 2; ++g) flow_chunks_[c].group_left[g].store(group_jobs[g], std::memory_order_relaxed);
+    }
+    mjobs_ = jobs; nfmt_ = &f;
+    flow_results_ = results; flow_weights_ = weights; flow_sum_ = sum; flow_k_ = top_k; flow_tokens_ = nt;
+    flow_owned_ = owned;
+    flow_tag_ = epoch_.load(std::memory_order_relaxed) + 1;   // the epoch begin_batch publishes
+    if (groups)
+        for (int group = 0; group < 2; ++group)
+            if (!group_jobs[group]) {
+                const int begin = group ? groups->split : 0, end = group ? nt : groups->split;
+                for (int t = begin; t < end; ++t)
+                    canon_route_sum(results + (size_t)t * top_k * f.n_embd, weights + t * top_k,
+                                    groups->sum[group] + (size_t)(t - begin) * f.n_embd, top_k, f.n_embd, 0, f.n_embd);
+                groups->complete(groups->context, group);
+            }
+    mode_ = 8;
+    njobs_ = total;
+    if (owned) {
+        // Each node's queue lists all of its gate/up parts before any down part.
+        local_tasks_[0].clear(); local_tasks_[1].clear();
+        for (int node = 0; node < 2; ++node) {
+            for (int stage = 0; stage < (groups ? 2 : 1); ++stage) {
+                auto in_stage = [&](int e) { return !groups || int(!(flow_experts_[e].group_mask & 1u)) == stage; };
+                for (int e = 0; e < n; ++e) if (in_stage(e))
+                    for (int part = 0; part < flow_gu_parts_; ++part)
+                        local_tasks_[node].push_back((e * 2 + node) * flow_gu_parts_ + part);
+                for (int e = 0; e < n; ++e) if (in_stage(e))
+                    for (int part = 0; part < flow_down_parts_; ++part)
+                        local_tasks_[node].push_back(flow_gu_tasks_ + (e * 2 + node) * flow_down_parts_ + part);
+            }
+        }
+        local_next0_.store(pack_head(flow_tag_, local_tasks_[0].size(), 0), std::memory_order_release);
+        local_next1_.store(pack_head(flow_tag_, local_tasks_[1].size(), 0), std::memory_order_release);
+        native_owned_phase_ = true;
+        native_local_phase_ = true;
+    } else {
+        native_owned_phase_ = false;
+        native_local_phase_ = false;
+    }
+    const uint32_t e = begin_batch(total);
+    if (host_works_) drain(-1, host_scratch_, e);
+    wait_done(total);
+    wait_parked("after a layer");
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    native_owned_phase_ = false; native_local_phase_ = false;
+    mode_ = 0;
+    flow_experts_[0].groups = nullptr;
+    multi_bytes += (int64_t) n * (int64_t) f.bytes;
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ms_layer_flow += ms;
+    ms_drain_ += ms;
+}
+
+void ExpertPool::reduce_routed(const float* results,const float* weights,float* output,int nt,int experts,int hidden,bool canon) {
+    reduce_canon_=canon;
+    if(!results||!weights||!output||nt<1||nt>MAXT||experts<1||experts>32||hidden<1||hidden>8192)throw std::invalid_argument("invalid routed reduction geometry");
+    reduce_results_=results;reduce_weights_=weights;reduce_output_=output;reduce_experts_=experts;reduce_hidden_=hidden;
+    native_owned_phase_=false;native_local_phase_=false;mrows_=int64_t(nt)*hidden;mtasks_=n_+(host_works_?1:0);
+    run_phase(7,mtasks_);mode_=0;
 }
 
 void ExpertPool::run(ExpertJob* jobs, int n) {

@@ -31,6 +31,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 
 #include <atomic>
+#include <array>
 #include <cstdio>
 #include <memory>
 #include <chrono>
@@ -38,6 +39,7 @@
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <stdexcept>
 #include <vector>
 
 namespace strata::kernels::cpu {
@@ -55,12 +57,18 @@ struct ExpertJob {
 /// Plan v0.3 P6: one expert for the `nt` tokens of a verify window that were routed to it.  Every token's output
 /// is bitwise the single-token job's.
 struct ExpertJobMulti {
+    int expert_id = -1; // model ID for optional calibration, not a scheduling slot
     const uint8_t* blob = nullptr;
     int nt = 0;
     const ActQ* act[MAXT] = {};
     float* out[MAXT] = {};
     /// Plan v0.3 P6: a native pack's activations (the layer's `vec_dot_type`), one per token.
     const void* nact[MAXT] = {};
+    const uint8_t* native_up = nullptr;
+    const uint8_t* native_down = nullptr;
+    // Node-local packed half-rows; all three projections are present together.
+    struct NumaRows {const uint8_t* gate=nullptr;const uint8_t* up=nullptr;const uint8_t* down=nullptr;};
+    NumaRows numa[2];
 };
 
 /// How worker threads are allocated across physical/logical CPU cores (#272).  `All` is the layout the pool has
@@ -133,6 +141,15 @@ void restore_thread_affinity(const ThreadAffinity& previous);
 
 class ExpertPool {
 public:
+    // A split verification pass may publish its first token group while the
+    // pool finishes experts used only by the second group. Callbacks run on a
+    // worker and must not throw or call the pool again.
+    struct LayerGroups {
+        int split = 0;
+        float *sum[2]{};
+        void (*complete)(void *, int) noexcept = nullptr;
+        void *context = nullptr;
+    };
     /// `n_workers <= 0` means "every physical core except the first".  Workers are pinned to physical cores
     /// (minus core 0 by default) and each owns one `ExpertScratch`, so nothing in the token path allocates.
     ///
@@ -158,6 +175,8 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    bool numa_rows_available()const {return numa_rows_available_;}
+    std::array<int,2> numa_cores()const {return numa_cores_;}
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
@@ -183,9 +202,27 @@ public:
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    void reduce_routed(const float* results,const float* weights,float* output,int nt,int experts,int hidden,bool canon=false);
+    /// One dispatch for a whole MoE layer instead of gate/up, host quantization, down and reduction phases.
+    /// Each expert's down rows start as soon as its own gate/up rows finish (the worker completing them
+    /// quantizes the hidden vector), and the worker completing a row chunk across every expert writes that
+    /// chunk's routed sum. `results` holds route rows (token * top_k + k) * n_embd, as `reduce_routed` reads
+    /// them. Outputs and `sum` are bitwise those of `run_split_multi_native` followed by `reduce_routed`.
+    void run_layer_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, const float* results,
+                          const float* weights, float* sum, int nt, int top_k);
+    void run_layer_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, const float* results,
+                          const float* weights, const LayerGroups& groups, int nt, int top_k);
+    double ms_layer_flow = 0;
+    // Diagnostic tuning between completed batches; the host owns scheduling.
+    void set_native_tasks_per_thread(int count) {
+        if (count < 1 || count > 16) throw std::invalid_argument("native tasks per thread must be 1..16");
+        native_tasks_per_thread_ = count;
+    }
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
+    double ms_native_local_prepare = 0;
+    int64_t native_local_queries = 0;
     int64_t multi_bytes = 0;
 
     /// Total `_mm_pause` iterations spent waiting, over all workers, is no longer counted - see the note on the
@@ -219,13 +256,38 @@ public:
     static constexpr std::chrono::seconds kStall{60};
 
 private:
+    // run_layer_native (mode 8): per-expert gate/up countdowns, ready tags, per-chunk countdowns.
+    struct alignas(64) FlowCounter {
+        std::atomic<int32_t> left{0}; std::atomic<uint32_t> ready{0};
+        std::atomic<int32_t> group_left[2]{}, group_chunks[2]{};
+        unsigned group_mask = 0;
+        const LayerGroups *groups = nullptr;
+    };
+    static_assert(sizeof(FlowCounter) == 64); // use the existing cache-line padding
+    std::unique_ptr<FlowCounter[]> flow_experts_, flow_chunks_;
+    size_t flow_chunk_capacity_ = 0;
+    const float* flow_results_ = nullptr;
+    const float* flow_weights_ = nullptr;
+    float* flow_sum_ = nullptr;
+    int flow_k_ = 0, flow_tokens_ = 0, flow_gu_parts_ = 1, flow_down_parts_ = 1, flow_gu_tasks_ = 0;
+    bool flow_owned_ = false;
+    uint32_t flow_tag_ = 0;
+    void flow_task(int i);
+    void run_layer_native_impl(const NativeFmt& f, ExpertJobMulti* jobs, int n, const float* results,
+                               const float* weights, float* sum, const LayerGroups* groups, int nt, int top_k);
+    const float* reduce_results_=nullptr;
+    const float* reduce_weights_=nullptr;
+    float* reduce_output_=nullptr;
+    int reduce_experts_=0,reduce_hidden_=0;
+    bool reduce_canon_=false;
     int phase_tasks(int64_t rows) const;
     int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
     void run_phase(int mode, int n_tasks);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
-    int claim(uint32_t epoch);
+    int claim(uint32_t epoch, int node = -1);
+    void prepare_native_local_tasks(int n_tasks);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
     uint32_t begin_batch(int n);
     /// The host's waits, bounded by `kStall`.
@@ -236,6 +298,20 @@ private:
 
     int n_ = 0;
     bool host_works_ = true;
+    int native_tasks_per_thread_ = 3;
+    bool native_local_enabled_ = false;
+    // A late parked worker can inspect dispatch flags while the host prepares
+    // the next epoch. Queue claims remain protected by their epoch tags.
+    std::atomic<bool> native_local_phase_{false};
+    std::atomic<bool> native_owned_phase_{false};
+    bool numa_rows_available_=false;
+    int native_owned_parts_=1;
+    std::array<int,2> numa_cores_{{-1,-1}};
+    bool native_local_reported_ = false;
+    std::vector<int> cpu_nodes_;
+    std::vector<int> local_tasks_[2];
+    alignas(64) std::atomic<uint64_t> local_next0_{0};
+    alignas(64) std::atomic<uint64_t> local_next1_{0};
     ExpertJob* jobs_ = nullptr;
     int njobs_ = 0;
     /// The host's own scratch when `host_works_`.  A separate object rather than a share of `scratch_[i]`,
@@ -290,7 +366,7 @@ private:
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][FF];
+        alignas(64) float ff[MAXT][kNativeFF];
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };

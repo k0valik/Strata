@@ -603,6 +603,37 @@ __device__ __forceinline__ float vec_dot_nvfp4_q8_1(const void* __restrict__ vbq
 // ---------------------------------------------------------------- the formats
 // qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
 template<int TY> struct Fmt;
+// The GLM Q2_K/Q3_K expert pack and the NextN layer's K-quants. Each call handles a contiguous Q8_1 sub-block.
+template<> struct Fmt<10> { static constexpr int qk = 256, ipb = 8, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int sub) {
+        const auto* w = (const block_q2_K*) v + kbx;
+        float sum = 0;
+        for (int j = 0; j < 32; ++j) {
+            const int i = sub * 32 + j;
+            const int group = i / 16;
+            const int q = (w->qs[(i / 128) * 32 + i % 32] >> (2 * ((i % 128) / 32))) & 3;
+            const float value = __low2float(w->dm) * (w->scales[group] & 15) * q -
+                                __high2float(w->dm) * (w->scales[group] >> 4);
+            sum += value * (int) y[sub].qs[j];
+        }
+        return sum * __low2float(y[sub].ds);
+    }
+};
+template<> struct Fmt<11> { static constexpr int qk = 256, ipb = 8, step = 1;
+    __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int sub) {
+        const auto* w = (const block_q3_K*) v + kbx;
+        float sum = 0;
+        for (int j = 0; j < 32; ++j) {
+            const int i = sub * 32 + j, group = i / 16;
+            const int low = (w->scales[group % 8] >> (4 * (group / 8))) & 15;
+            const int high = ((w->scales[8 + group % 4] >> (2 * (group / 4))) & 3) << 4;
+            const int q = ((w->qs[(i / 128) * 32 + i % 32] >> (2 * ((i % 128) / 32))) & 3) -
+                          ((w->hmask[i % 32] & (1 << (i / 32))) ? 0 : 4);
+            sum += __half2float(w->d) * ((low | high) - 32) * q * (int) y[sub].qs[j];
+        }
+        return sum * __low2float(y[sub].ds);
+    }
+};
 template<> struct Fmt<16> { static constexpr int qk = 256, ipb = 8, step = 2;
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_iq2_xxs_q8_1(v, y, kbx, iqs); } };
 template<> struct Fmt<17> { static constexpr int qk = 256, ipb = 8, step = 2;
@@ -641,6 +672,7 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 // The formats of each role, one list each so a type cannot be in one switch and missing from another.  Every
 // entry is a kernel template for each CUDA architecture of the build, hence two lists rather than one.
 #ifdef STRATA_Q6K_EXPERTS   // opt-in build (-DSTRATA_Q6K_EXPERTS=ON): one more instance per kernel, loaded at start
+<<<<<<< this fork
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8) X(40)
 #else
 #define STRATA_GU_FMTS(X) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8) X(40)
@@ -654,6 +686,14 @@ template<> struct Fmt<8> { static constexpr int qk = 32, ipb = QI8_0 / VDR_Q8_0,
 #define STRATA_MMVQ_FMTS(X) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8) X(40)
 template<> struct Fmt<40> { static constexpr int qk = 64, ipb = 2, step = 4;     // NVFP4: 2 calls of 32 values
     __device__ static float dot(const void* v, const block_q8_1* y, int kbx, int iqs) { return vec_dot_nvfp4_q8_1(v, y, kbx, iqs); } };
+=======
+#define STRATA_GU_FMTS(X) X(10) X(11) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(14) X(6) X(2) X(3) X(8)
+#else
+#define STRATA_GU_FMTS(X) X(10) X(11) X(16) X(17) X(18) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(6) X(2) X(3) X(8)
+#endif
+#define STRATA_D_FMTS(X) X(11) X(12) X(18) X(21) X(20) X(23) X(42) X(7) X(6) X(2) X(3) X(8)
+#define STRATA_MMVQ_FMTS(X) X(10) X(11) X(16) X(17) X(18) X(20) X(21) X(22) X(23) X(29) X(42) X(12) X(13) X(7) X(6) X(2) X(3) X(8)
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
 
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
@@ -1459,11 +1499,12 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
 }
 
 __global__ void swiglu_entries_kernel(const float* __restrict__ gate, const float* __restrict__ up, float* __restrict__ h,
-                                      long long n) {
+                                      long long n, float limit = 0.f) {
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    const float g = gate[i];
-    h[i] = (g / (1.0f + __expf(-g))) * up[i];
+    const float g = limit > 0 ? fminf(gate[i], limit) : gate[i];
+    const float u = limit > 0 ? fmaxf(-limit, fminf(up[i], limit)) : up[i];
+    h[i] = (g / (1.0f + __expf(-g))) * u;
 }
 
 template<int TD>
@@ -1691,18 +1732,19 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
                                                                   const float* __restrict__ up,
                                                                   const int32_t* __restrict__ grp_start,
                                                                   const int32_t* __restrict__ n_groups, int n_ff,
-                                                                  block_q8_1* __restrict__ hq) {
+                                                                  block_q8_1* __restrict__ hq, float limit = 0.f) {
 #if defined(__HIPCC__)
 #pragma clang fp contract(off)
 #endif
     const long long lo = (long long) grp_start[0] * n_ff, hi = (long long) grp_start[*n_groups] * n_ff;
     for (long long i = lo + (long long) blockIdx.x * blockDim.x + threadIdx.x; i < hi;
          i += (long long) gridDim.x * blockDim.x) {
-        const float g = gate[i];
+        const float g = limit > 0 ? fminf(gate[i], limit) : gate[i];
+        const float u = limit > 0 ? fmaxf(-limit, fminf(up[i], limit)) : up[i];
 #if defined(__HIPCC__)
-        const float h = (g / (1.0f + __expf(-g))) * up[i];
+        const float h = (g / (1.0f + __expf(-g))) * u;
 #else
-        const float h = __fmul_rn(g / (1.0f + __expf(-g)), up[i]);
+        const float h = __fmul_rn(g / (1.0f + __expf(-g)), u);
 #endif
         q8_1_store(h, hq, i);
     }
@@ -1712,6 +1754,11 @@ __global__ void __launch_bounds__(256) swiglu_q8_1_entries_kernel(const float* _
 template<typename dst_t> __device__ __forceinline__ dst_t cvt(float v);
 template<> __device__ __forceinline__ float cvt<float>(float v) { return v; }
 template<> __device__ __forceinline__ __half cvt<__half>(float v) { return __float2half(v); }
+template<> __device__ __forceinline__ uint16_t cvt<uint16_t>(float v) {
+    uint32_t u = __float_as_uint(v);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return uint16_t((u >> 16) | 64u);
+    return uint16_t((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
 
 template<typename dst_t>
 __device__ void dq_iq2_xxs(const void* vx, int64_t ibs, dst_t* yy, int tid) {
@@ -1829,6 +1876,15 @@ __device__ void dq_q3_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
         const uint8_t* q = x->qs + 32 * n;
         const uint8_t* hm = x->hmask;
         for (int l = l0; l < l0 + 4; ++l) y[l] = cvt<dst_t>(dl * ((int8_t) ((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4)));
+    }
+}
+template<typename dst_t>
+__device__ void dq_q2_k(const void* vx, int64_t ibs, dst_t* yy, int tid) {
+    const auto* x = (const block_q2_K*) vx + ibs;
+    for (int i = tid; i < 256; i += 32) {
+        const int q = (x->qs[(i / 128) * 32 + i % 32] >> (2 * ((i % 128) / 32))) & 3;
+        const int s = x->scales[i / 16];
+        yy[i] = cvt<dst_t>(__low2float(x->dm) * (s & 15) * q - __high2float(x->dm) * (s >> 4));
     }
 }
 template<typename dst_t>
@@ -2039,6 +2095,7 @@ __device__ __forceinline__ void dq_dispatch(int ty, const void* vx, int64_t ibs,
         case 22: dq_iq2_s(vx, ibs, y, tid); break;
         case 29: dq_iq1_m(vx, ibs, y, tid); break;
         case 23: dq_iq4_xs(vx, ibs, y, tid); break;
+        case 10: dq_q2_k(vx, ibs, y, tid); break;
         case 11: dq_q3_k(vx, ibs, y, tid); break;
         case 42: dq_q2_0(vx, ibs, y, tid); break;
         case 12: dq_q4_k(vx, ibs, y, tid); break;
@@ -2092,7 +2149,7 @@ __global__ void dequant_gu_kernel(int ty, const void* __restrict__ gate, const v
 
 // the types dq_dispatch dequantizes
 bool is_iq(int t) {
-    return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
+    return t == 10 || t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
 #ifdef STRATA_Q6K_EXPERTS
            t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 || t == 40;
 #else
@@ -2880,6 +2937,7 @@ bool embed_type_supported(int t) noexcept { return is_iq(t) || t == 30; }
 
 size_t iq_row_bytes(int t, int64_t n) noexcept {
     switch (t) {
+        case 10: return (size_t) (n / 256) * sizeof(block_q2_K);
         case 16: return (size_t) (n / 256) * sizeof(block_iq2_xxs);
         case 17: return (size_t) (n / 256) * sizeof(block_iq2_xs);
         case 18: return (size_t) (n / 256) * sizeof(block_iq3_xxs);
@@ -2929,6 +2987,11 @@ void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stre
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst, scale);
     check("iq_dequant_f16");
+}
+void iq_dequant_bf16(int t, const void* src, int64_t n, uint16_t* dst, void* stream) {
+    if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_bf16: bad arguments\n"); std::exit(1); }
+    dequant_flat_kernel<uint16_t><<<(unsigned)(n / 256), 32, 0, (cudaStream_t)stream>>>(t, src, dst);
+    check("iq_dequant_bf16");
 }
 
 namespace {
@@ -3641,7 +3704,8 @@ void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups) {
+                           int64_t grid_groups, int64_t batch_tokens) {
+    (void) batch_tokens;   // the GLM branch's 2-wide resident kernels are subsumed by the exact 1..4-wide passes
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
@@ -3776,12 +3840,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #else
     const bool sw_v1 = v1;
 #endif
-    if (sw_v1) {
-        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+    // GLM's clamped SwiGLU takes the separate pass unless STRATA_GLM_FUSED_CLAMP=1.
+    static const bool fused_clamp = env_on("STRATA_GLM_FUSED_CLAMP");
+    if (sw_v1 || (L.swiglu_limit > 0 && !fused_clamp)) {
+        swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh, L.swiglu_limit);
         quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
     } else {
         swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
-                                                                                (int) L.n_ff, hq);
+                                                                                (int) L.n_ff, hq, L.swiglu_limit);
     }
     check("native_expert_grouped/swiglu");
     }

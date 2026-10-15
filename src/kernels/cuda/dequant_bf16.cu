@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace strata::kernels {
 namespace {
@@ -175,6 +176,7 @@ __global__ void dequant_kernel(const uint8_t* __restrict__ blocks, int64_t row_b
     group32<TYPE>(blocks + (row0 + r) * row_bytes, (int) gi, out + r * ld + gi * 32);
 }
 
+<<<<<<< this fork
 // ---- the wide kernels: a thread per 8 values (Pascal, sm_61) --------------------------------------------------------
 // dequant_kernel's thread reads its 32-value group a byte at a time and writes 32 two-byte values one by one, 64 bytes
 // from its neighbour's.  On a Tesla P40 (sm_61) that is 7.2 ms for a 10240 x 2560 Q6_K weight (10 GB/s), and the IQ3_S
@@ -279,6 +281,35 @@ bool dequant_wide_on() {
         per_dev[dev] = major == 6 && minor == 1 ? 2 : 1;
     }
     return per_dev[dev] == 2;
+=======
+// Preserve group32 arithmetic, then reorder only the stores. The extra shared
+// element per group prevents bank conflicts between threads writing their groups.
+template <int TYPE, typename T>
+__global__ void dequant_coalesced(const uint8_t* __restrict__ blocks, int64_t row_bytes, int64_t row0,
+                                 int64_t rows, int64_t groups_per_row, T* __restrict__ out) {
+    __shared__ T tile[256 * 33];
+    const int64_t first = (int64_t)blockIdx.x * 256;
+    const int64_t total = rows * groups_per_row;
+    const int64_t g = first + threadIdx.x;
+    if (g < total)
+        group32<TYPE>(blocks + (row0 + g / groups_per_row) * row_bytes,
+                      (int)(g % groups_per_row), tile + threadIdx.x * 33);
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+        const int i = threadIdx.x + j * 256;
+        if (first * 32 + i < total * 32)
+            out[first * 32 + i] = tile[(i / 32) * 33 + i % 32];
+    }
+}
+
+bool coalesced_stores() {
+    const char* value = std::getenv("STRATA_GLM_DEQUANT_COALESCED");
+    if (!value || std::strcmp(value, "0") == 0) return false;
+    if (std::strcmp(value, "1") == 0) return true;
+    std::fprintf(stderr, "STRATA_GLM_DEQUANT_COALESCED must be 0 or 1\n");
+    std::exit(1);
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
 }
 
 // Q8_0 with four threads per block, 8 values each: the warp reads 8 consecutive blocks and writes 512 consecutive
@@ -343,6 +374,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         if (e != cudaSuccess) { std::fprintf(stderr, "dequant launch: %s\n", cudaGetErrorString(e)); std::exit(1); }
         return;
     }
+<<<<<<< this fork
     // the wide kernels: even block addresses, 16-byte stores at every row (contiguous or a stride of whole stores)
     if (wide_type(type) && (reinterpret_cast<uintptr_t>(blocks) & 1) == 0 && (reinterpret_cast<uintptr_t>(out) & 15) == 0 &&
         ((size_t) ld * sizeof(T)) % 16 == 0 && 4 * total < (1ll << 31) && dequant_wide_on()) {
@@ -360,6 +392,15 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
         return;
     }
 #define STRATA_DQ(TY) dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out); break
+=======
+    // Other formats: the opt-in coalesced stores (STRATA_GLM_DEQUANT_COALESCED=1) write contiguous rows; a strided
+    // destination (ld) keeps the per-group kernel.
+    const bool coalesced = coalesced_stores() && ld == cols;
+#define STRATA_DQ(TY) \
+    if (coalesced) dequant_coalesced<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, out); \
+    else dequant_kernel<TY, T><<<grid, 256, 0, st>>>(p, row_bytes, row0, rows, gpr, ld, out); \
+    break
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
     switch (type) {
     case 2: STRATA_DQ(2);
     case 6: STRATA_DQ(6);
@@ -380,21 +421,33 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
 
 }  // namespace
 
+<<<<<<< this fork
 void dequant_set_wide(int mode) { g_dequant_wide = mode; }
+=======
+namespace {
+// plan v0.3 P6: the i-quant formats (llama.cpp's dequantizers, iq_kernels.cu)
+// Q2_K (10) has no generic geometry here; iq_kernels.cu carries llama.cpp's dequantize_block_q2_K.
+bool iq_only(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29 || t == 10; }
+}  // namespace
+>>>>>>> their fork (github.com-lighttransport-Strata-glm53f)
 
 bool dequant_bf16_supported(int ggml_type) noexcept {
     int a, b;
     return geometry(ggml_type, a, b);
 }
 
-namespace {
-// plan v0.3 P6: the i-quant formats (llama.cpp's dequantizers, iq_kernels.cu)
-bool iq_only(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29; }
-}  // namespace
-
 void dequant_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
                   void* stream) {
     launch<uint16_t>(ggml_type, blocks, row0, rows, cols, out, stream);
+}
+void dequant_expert_bf16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols,
+                         uint16_t* out, void* stream) {
+    if (iq_only(ggml_type)) {
+        iq_dequant_bf16(ggml_type, (const uint8_t*)blocks + (size_t)row0 * iq_row_bytes(ggml_type, cols),
+                        rows * cols, out, stream);
+        return;
+    }
+    dequant_bf16(ggml_type, blocks, row0, rows, cols, out, stream);
 }
 
 void dequant_f16(int ggml_type, const void* blocks, int64_t row0, int64_t rows, int64_t cols, uint16_t* out,
