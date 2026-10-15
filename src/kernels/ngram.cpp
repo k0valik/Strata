@@ -20,6 +20,9 @@
 #include <atomic>
 #include <thread>
 #include <vector>
+#include <algorithm>
+#include <cstdlib>
+#include <thread>
 #include <stdexcept>
 
 #if defined(_WIN32)
@@ -545,6 +548,7 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         return true;
     }
     wait_prefetches();
+<<<<<<< this fork
     // #1984 #1971: a mapped table that is not in the file cache served this loop as serial demand faults, one random
     // 4 KiB page at a time (16 rows a token, 16 x the chunk's tokens for a prompt), and the first chunk of a prompt has
     // only layer 0 to hide it behind: a cold 27 GB table at ~0.2-1 ms a fault is minutes with no progress mark, which
@@ -578,6 +582,35 @@ bool PleTable::gather_batch(const uint32_t* rows, size_t n_tokens, float* out, s
         const size_t e = std::min(n, w + kWin);
         for (size_t i = w; i < e; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
     }
+=======
+    // the prompt path's batch (16 rows a token, scattered over the table) on several threads: one thread decoded a
+    // 3,072-token chunk's 49,152 rows in ~375 ms on POWER9 and set the pace of a 4-GPU prompt (the first stage waited
+    // ~14 ms a chunk for it). Each row decodes into its own slot: the same output on any thread count.
+    // STRATA_PLE_GATHER_THREADS (default 8; 1 = the serial loop)
+    static const int nth = [] {
+        const char* v = std::getenv("STRATA_PLE_GATHER_THREADS");
+        const int k = v ? std::atoi(v) : 8;
+        return k < 1 ? 1 : (k > 64 ? 64 : k);
+    }();
+    if (nth > 1 && n >= 4096 && impl_->data != nullptr) {
+        std::vector<std::thread> th;
+        const size_t per = (n + (size_t) nth - 1) / (size_t) nth;
+        for (int k = 0; k < nth; ++k) {
+            const size_t i0 = (size_t) k * per, i1 = std::min(n, i0 + per);
+            if (i0 >= i1) break;
+            th.emplace_back([this, rows, out, i0, i1] {
+                for (size_t i = i0; i < i1; ++i) {
+                    if (rows[i] >= impl_->n_rows) std::memset(out + i * PLE_HEAD_DIM, 0, (size_t) PLE_HEAD_DIM * sizeof(float));
+                    else impl_->decode(impl_->data + (size_t) rows[i] * impl_->rb, out + i * PLE_HEAD_DIM);
+                }
+            });
+        }
+        for (auto& t : th) t.join();
+        impl_->bytes_read += (uint64_t) n * impl_->rb;
+        return true;
+    }
+    for (size_t i = 0; i < n; ++i) read_row(rows[i], out + i * PLE_HEAD_DIM);
+>>>>>>> their fork (github.com-eelgaev-Strata-AC922-ac922)
     return true;
 }
 

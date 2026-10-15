@@ -6,10 +6,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "strata/platform/cpu_relax.hpp"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <immintrin.h>
-#else
+#elif defined(STRATA_X86)
 #include <cpuid.h>
 #endif
 #include <fstream>
@@ -38,6 +39,32 @@ int cpu_isa_cap() {
     return cap;
 }
 
+#if !defined(STRATA_X86)
+// aarch64 / other: no AVX kernels exist in this build (CMake leaves their files out); the experts run on ggml-cpu's
+// own (NEON) dot products.
+bool cpu_avx512_ok() { return false; }
+bool cpu_avx2_ok() { return false; }
+bool cpu_avx1_ok() { return false; }
+bool cpu_sse42_ok() { return false; }
+// the AVX-2 gather decode (iq_avx2.cpp) does not exist here
+int iq256_gather_setting() { return 0; }
+bool cpu_gather_fast() { return false; }
+bool cpu_gather_fast_here() { return false; }
+std::string cpu_name() {
+    std::ifstream f("/proc/cpuinfo");
+    std::string line;
+    while (std::getline(f, line))
+        if (line.rfind("model name", 0) == 0 || line.rfind("Model name", 0) == 0) {
+            const size_t c = line.find(':');
+            if (c != std::string::npos) return line.substr(line.find_first_not_of(' ', c + 1));
+        }
+#if defined(__aarch64__)
+    return "aarch64";
+#else
+    return "unknown";
+#endif
+}
+#else
 bool cpu_avx512_ok() {
     static const bool ok = [] {
         if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
@@ -352,6 +379,8 @@ void cpu_require_expert_support() {
                  f.reason());
     std::exit(1);
 }
+
+#endif  // STRATA_X86
 
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1) {

@@ -64,7 +64,9 @@ int main() {
     std::printf("router_dot_parity: %s (avx2 %d, avx %d)\n", cpu::cpu_name().c_str(), (int) cpu::cpu_avx2_ok(),
                 (int) cpu::cpu_avx1_ok());
     if (cpu::cpu_avx2_ok()) run("avx2", cpu::bf16_rows_dot_multi);
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     if (cpu::cpu_avx1_ok()) run("avx", cpu::bf16_rows_dot_multi_avx1);
+#endif
     std::printf("router_dot_parity: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }
