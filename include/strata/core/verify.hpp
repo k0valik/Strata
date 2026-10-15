@@ -227,7 +227,7 @@ public:
     }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
-    /// commit() returns without waiting for its graph (a single-GPU session sets it): the next window follows it on
+    /// commit() returns without waiting for its graph (every stage of a layer split too): the next window follows it on
     /// the same stream and the drafter reads nothing it writes, so it overlaps the draft. Whoever reads or writes
     /// the session from another stream or the host afterwards (a new request, a checkpoint, a snapshot, the prompt
     /// path, the end of a run) calls wait_commit() first.  STRATA_COMMIT_SYNC=1 keeps the wait.
@@ -307,6 +307,10 @@ public:
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    /// A layer split's idle NVLink peer fetches half of this stage's PCIe experts (partner_fetch, verify_kernels.hpp):
+    /// call after set_pcie_mode, before the first window.  STRATA_FETCH_PARTNER=0: off.  No-op unless the copy kernel
+    /// overlaps (pcie_mode 2, STRATA_FETCH_OVERLAP) and the peer reaches this GPU.
+    bool set_partner(int dev, std::string& err);
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     double ms_wait = 0, ms_pool = 0, ms_host = 0, ms_commit = 0;
@@ -483,6 +487,16 @@ private:
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
+    // the PCIe share's copy kernel on its own stream beside the VRAM experts (STRATA_FETCH_OVERLAP, default on)
+    cudaStream_t fetch_s_ = nullptr;
+    cudaEvent_t ev_plan_ = nullptr, ev_fetched_ = nullptr;
+    bool fetch_overlap_ = false;
+    int partner_ = -1;                                            // set_partner: the peer GPU, or -1
+    cudaStream_t partner_s_ = nullptr;                            // on the peer
+    unsigned* partner_arrive_ = nullptr;                          // on the peer, one per step
+    long long* partner_bytes_ = nullptr;                          // on the peer, blob bytes per layer
+    uint32_t* h_pdone_ = nullptr; uint32_t* m_pdone_ = nullptr;   // mapped, one per step: the peer's share landed
+    static constexpr int kMaxSteps = 2 * 64 * 2;
     struct FlagSet { uint32_t* flag; uint32_t value; };
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);

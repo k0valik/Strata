@@ -54,6 +54,11 @@ inline constexpr int32_t kNotResident = -1;
 bool read_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                          std::vector<std::pair<int32_t, int32_t>>& ranked, int64_t& slots, std::string& err);
 
+/// Free device memory for the expert cache.  On a unified memory system - one memory for the CPU and the GPU, such as
+/// the DGX Spark (GB10); CUDA reports it as cudaDevAttrIntegrated - cudaMemGetInfo counts only MemFree, not the page cache - which, with the experts read from the GGUF in place, is mostly those
+/// files' clean pages and gives way to a device allocation.  There the figure is MemAvailable less 6 GiB for the OS
+/// and the engine's host side (STRATA_UMA_HEADROOM_GIB).  Elsewhere it is cudaMemGetInfo's.
+size_t device_free_bytes();
 /// #477 (--expert-profile-save): what the adaptive tier learned, as a profile ranking EVERY (layer, expert) pair -
 /// the experts resident in VRAM now first (where the swaps left the cache), then the rest; within each, by `heat`
 /// (the routing the adaptive tier counted since the start, descending), then by `prior` (the profile the engine
