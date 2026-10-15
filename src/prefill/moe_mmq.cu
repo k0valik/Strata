@@ -61,6 +61,7 @@ __global__ void copy16_kernel(const uint4* __restrict__ a, int64_t na, const uin
     else if (i < n + 2 * nz) c_dst[nc + (i - n - nz)] = make_uint4(0, 0, 0, 0);
     else if (i == n + 2 * nz && tail != nullptr) *tail_dst = *tail;
 }
+<<<<<<< this fork
 // copy16_kernel for an MMQ group: blockIdx.y is the expert (first + y); the last one (n - 1) also zeroes nz uint4
 // after its gu and d slots, and each copies its NVFP4 tail (tail_off, in uint4; tail_dst null = none)
 struct GroupArgs {
@@ -82,6 +83,8 @@ __global__ void copy16_group_kernel(GroupArgs ga, int first, int n, int64_t na, 
     else if (i < m + 2 * nz) { if (q == n - 1) cd[ga.d_stride + (i - m - nz)] = make_uint4(0, 0, 0, 0); }
     else if (i == m + 2 * nz && tail_dst != nullptr) tail_dst[q] = src[ga.tail_off];
 }
+=======
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
 __global__ void copy1_kernel(const uint8_t* __restrict__ a, int64_t na, const uint8_t* __restrict__ b, int64_t nb,
                              uint8_t* __restrict__ ab_dst, const uint8_t* __restrict__ c, int64_t nc, uint8_t* __restrict__ c_dst) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -159,19 +162,6 @@ __global__ void iota_kernel(int32_t* dst, int64_t n) {
     if (i < n) dst[i] = (int32_t) i;
 }
 
-#if defined(__HIPCC__)   // #820: only the HIP dense-MMQ path (Gemm::native_mmq) uses these two
-__global__ void f16_to_f32_kernel(const uint16_t* __restrict__ x, float* __restrict__ y, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = __half2float(__ushort_as_half(x[i]));
-}
-
-__global__ void set_bounds_kernel(int32_t* d, int32_t rows) {
-    d[0] = 0;
-    d[1] = rows;
-}
-
-#endif
-
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 }  // namespace
@@ -200,6 +190,7 @@ Nvfp4Mode nvfp4_mode() {
 
 bool supported(int t) {
     switch ((ggml_type) t) {
+<<<<<<< this fork
         case GGML_TYPE_Q2_0:
 #ifdef STRATA_ORCA_Q4KS_MMQ
         case GGML_TYPE_Q5_0:   // #296 (Q4_K and Q5_1: STRATA_MMQ_KQUANTS)
@@ -217,11 +208,20 @@ bool supported(int t) {
         case GGML_TYPE_NVFP4:
             return nvfp4_mode() != Nvfp4Mode::FP16;
 #endif
+=======
+        case GGML_TYPE_Q2_0: case GGML_TYPE_IQ1_S: case GGML_TYPE_IQ2_XXS: case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q6_K: case GGML_TYPE_Q5_1:   // unsloth's files
+        case GGML_TYPE_Q8_0:
+            return true;
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
         default:
             return false;
     }
 }
 
+<<<<<<< this fork
 bool fits(int t, int64_t w_rows) {
     if (!supported(t)) return false;
     // llama.cpp's MMQ runs the "fallback" configs when the rows are not a multiple of 128, and the caller picks a
@@ -253,6 +253,8 @@ bool fits(int t, int64_t w_rows) {
     return true;
 }
 
+=======
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
 size_t matrix_bytes(int t, int64_t rows, int64_t cols) {
     return (size_t) rows * (size_t) (cols / ggml_blck_size((ggml_type) t)) * ggml_type_size((ggml_type) t);
 }
@@ -372,6 +374,7 @@ void Context::run(const Product& p, void* stream) {
                         1, 1, 0, 0, 0,
                         p.max_rows, j_best};
     switch (t) {
+<<<<<<< this fork
 #ifdef STRATA_ORCA_Q4KS_MMQ
         case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0, GGML_PREC_Q8>(ctx, a, s); break;
 #endif
@@ -405,6 +408,22 @@ void Context::run(const Product& p, void* stream) {
             else run_nvfp4_w4a8(ctx, a, s);
             break;
 #endif
+=======
+        case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
+        case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
+        case GGML_TYPE_IQ3_XXS: mul_mat_q_case<GGML_TYPE_IQ3_XXS>(ctx, a, s); break;
+        case GGML_TYPE_IQ3_S: mul_mat_q_case<GGML_TYPE_IQ3_S>(ctx, a, s); break;
+        case GGML_TYPE_IQ4_NL: mul_mat_q_case<GGML_TYPE_IQ4_NL>(ctx, a, s); break;
+        case GGML_TYPE_IQ4_XS: mul_mat_q_case<GGML_TYPE_IQ4_XS>(ctx, a, s); break;
+        case GGML_TYPE_Q8_0: mul_mat_q_case<GGML_TYPE_Q8_0>(ctx, a, s); break;
+        case GGML_TYPE_IQ1_S: mul_mat_q_case<GGML_TYPE_IQ1_S>(ctx, a, s); break;
+        case GGML_TYPE_Q4_K: mul_mat_q_case<GGML_TYPE_Q4_K>(ctx, a, s); break;
+        case GGML_TYPE_Q5_K: mul_mat_q_case<GGML_TYPE_Q5_K>(ctx, a, s); break;
+        case GGML_TYPE_Q6_K: mul_mat_q_case<GGML_TYPE_Q6_K>(ctx, a, s); break;
+        case GGML_TYPE_Q5_1: mul_mat_q_case<GGML_TYPE_Q5_1>(ctx, a, s); break;
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
         default:
             std::fprintf(stderr, "prefill mmq: type %d is not covered\n", (int) t);
             std::exit(1);
@@ -435,6 +454,7 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
     ck(cudaGetLastError(), "gather_native");
 }
 
+<<<<<<< this fork
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
                          void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream, size_t tail_off,
                          void* tail_dst, size_t zero_bytes) {
@@ -459,6 +479,8 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
     return true;
 }
 
+=======
+>>>>>>> their fork (github.com-eddoursul-Strata-custom)
 void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stream) {
     strata_q2_kernel<<<blocks(1280LL * 40 + 2560LL * 10), 256, 0, (cudaStream_t) stream>>>(blob, (uint16_t*) gu_dst,
                                                                                          (uint16_t*) d_dst);
@@ -488,18 +510,5 @@ void iota(int32_t* dst, int64_t n, void* stream) {
     iota_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(dst, n);
     ck(cudaGetLastError(), "iota");
 }
-
-#if defined(__HIPCC__)
-void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream) {
-    if (n <= 0) return;
-    f16_to_f32_kernel<<<blocks(n), 256, 0, (cudaStream_t) stream>>>(x, y, n);
-    ck(cudaGetLastError(), "f16_to_f32");
-}
-
-void set_bounds(int32_t* dst, int32_t rows, void* stream) {
-    set_bounds_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(dst, rows);
-    ck(cudaGetLastError(), "set_bounds");
-}
-#endif
 
 }  // namespace strata::prefill::mmq
