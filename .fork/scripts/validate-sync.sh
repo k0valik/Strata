@@ -53,15 +53,33 @@ printf 'validate-sync: %s at %s\n' "$REPO_DIR" "$BASE_REF"
 printf '\n== fork files ==\n'
 for f in .fork/upstream.lock .fork/path-policy .fork/README.md \
          .fork/scripts/sync-upstream.sh .fork/scripts/validate-sync.sh \
+         .fork/scripts/fork-replay.sh .fork/scripts/replay-candidates.sh \
+         .fork/tests/replay-fixture.sh .fork/fork-candidates \
          .github/workflows/sync-upstream.yml FORK_NOTES.md .gitmodules; do
   expect_file "$f"
 done
 
-for f in .fork/scripts/sync-upstream.sh .fork/scripts/validate-sync.sh; do
+for f in .fork/scripts/sync-upstream.sh .fork/scripts/validate-sync.sh \
+         .fork/scripts/fork-replay.sh .fork/scripts/replay-candidates.sh \
+         .fork/tests/replay-fixture.sh; do
   if [ -x "$f" ]; then pass "executable: $f"; else fail "not executable: $f"; fi
 done
 
 # ----------------------------------------------------------------- metadata --
+
+printf '\n== .fork/fork-candidates ==\n'
+git show "$BASE_REF:.fork/fork-candidates" > "$work/candidates"
+cand_bad=0
+cand_n=0
+while read -r slug url branch; do
+  case $slug in ''|\#*) continue ;; esac
+  cand_n=$((cand_n + 1))
+  [ -n "$branch" ] || { fail "candidate $slug: missing branch"; cand_bad=1; }
+  case $url in https://*) ;; *) fail "candidate $slug: URL is not https: $url"; cand_bad=1 ;; esac
+done < "$work/candidates"
+if [ "$cand_bad" -eq 0 ]; then
+  pass "candidates parse ($cand_n entries, https URLs, branches set)"
+fi
 
 printf '\n== .fork/upstream.lock ==\n'
 git show "$BASE_REF:.fork/upstream.lock" > "$work/upstream.lock"

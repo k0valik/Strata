@@ -14,10 +14,14 @@ this file explains the mechanism.
 |---|---|
 | `upstream.lock` | upstream repository, branch, and the revision this fork's default branch already contains |
 | `path-policy` | how an upstream change to a path is classified |
+| `fork-candidates` | foreign forks worth replaying onto this fork (slug, URL, branch) |
 | `scripts/sync-upstream.sh` | prepares (and optionally publishes) the synchronization candidate |
 | `scripts/validate-sync.sh` | static checks for this setup, repository invariants and the workflow |
 | `scripts/lib.sh` | shared helpers (policy parsing, `git merge-tree` plumbing, reporting) |
-| `tests/run.sh` | fixture tests: miniature repositories exercising every outcome |
+| `scripts/fork-replay.sh` | replays a foreign fork's retained-surface work as squashed, policy-filtered commits |
+| `scripts/replay-candidates.sh` | runs `fork-replay.sh` over `fork-candidates` |
+| `tests/run.sh` | fixture tests: miniature repositories exercising every sync outcome |
+| `tests/replay-fixture.sh` | fixture test for the replay tool (dummy text repositories, no network) |
 
 ## What a synchronization run does
 
@@ -86,6 +90,39 @@ different lines.  A clean merge says nothing about meaning — if upstream fixed
 its own way, the merged file can hold a duplicated or contradictory fix — so the report lists
 the paths and asks for the file to be read, not just its status.  The reason each divergence
 exists is not derivable from git and lives in `FORK_NOTES.md` under "Active source divergences".
+
+## Replaying foreign forks
+
+Upstream has forks that carry real engine work, but hundreds of commits ahead
+mixed with thousands of files this fork deliberately dropped is not reviewable.
+`fork-replay.sh` makes them reviewable:
+
+1. fetch the foreign fork and upstream (git objects only — nothing executed);
+2. diff their fork point against their tip;
+3. classify every changed path with **the same** `.fork/path-policy` the sync
+   uses — dropped/ours/protected paths never enter the replay at all;
+4. replay what survives onto this fork's branch as **one squashed commit per
+   area**, applied with a three-way merge; each commit names the original
+   authors and the original commit subjects it came from;
+5. verify: only mirrored paths may change, and every file that was pristine on
+   our side must come out byte-identical to the foreign fork's version.
+
+Files whose hunks land on lines this fork has changed are **not discarded**:
+they come in as three-way merges with conflict markers, exactly like a pull
+request with conflicts — resolve them, do not throw the work away.  A group
+whose merged result matches this fork's tree is reported as "already present".
+
+A foreign fork whose history shares **no ancestry** with upstream (rewritten or
+grafted commits) has no fork point to diff against.  Such a replay is flagged
+**HISTORY REPLACED** in the report: the diff is their tree against the accepted
+baseline and may contain upstream's own post-fork changes in reverse, so its
+diffstat is an upper bound and its whole-file deletions are never replayed
+automatically.  Read such branches per file; the byte-exact verification means
+"matches their tree", not "safe to take".
+
+The output is a review artifact, never evidence that anything works: the replay
+is not built and not tested.  Nothing is pushed and no pull request is opened
+unless `--push`/`--pr` is given; the pull request body is the run's report.
 
 ## The accepted revision is the merge base
 
@@ -217,7 +254,11 @@ synchronization never fetches submodules and never alters the gitlink.
 .fork/scripts/validate-sync.sh                  # setup + repository invariants
 .fork/scripts/sync-upstream.sh                  # dry run against the base branch
 .fork/scripts/sync-upstream.sh --classify src/  # what would happen to a path
-.fork/tests/run.sh                              # fixture tests for the machinery
+.fork/scripts/fork-replay.sh --fork URL --branch NAME          # replay one fork
+.fork/scripts/fork-replay.sh --fork URL --branch NAME --pr     # ... as a PR
+.fork/scripts/replay-candidates.sh .fork/fork-candidates /tmp/reports  # the queue
+.fork/tests/run.sh                              # fixture tests for the sync
+.fork/tests/replay-fixture.sh                   # fixture test for the replay
 ```
 
 The dry run fetches upstream's objects into `refs/remotes/fork-sync/*`, writes the

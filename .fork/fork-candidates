@@ -1,0 +1,22 @@
+# .fork/fork-candidates -- foreign forks worth replaying onto this fork.
+#
+#   <slug>  <repository URL>  <branch>
+#
+# One entry per line; '#' starts a comment.  The slug names the replay branch
+# (replay/<slug>) and the report.  Run them with:
+#
+#   .fork/scripts/replay-candidates.sh .fork/fork-candidates <reports-dir>
+#
+# or replay a single fork directly:
+#
+#   .fork/scripts/fork-replay.sh --fork URL --branch NAME [--push|--pr]
+#
+# The list is a review queue, not an endorsement: an entry says "worth
+# reading", and the replay output is a review artifact, never evidence that
+# anything works.
+
+eddoursul        https://github.com/eddoursul/Strata       custom
+lighttransport   https://github.com/lighttransport/Strata  glm53f
+maxfridbe        https://github.com/maxfridbe/Strata_B70   main
+eelgaev          https://github.com/eelgaev/Strata-AC922   ac922
+gputier          https://github.com/gputier/StrataGP       main

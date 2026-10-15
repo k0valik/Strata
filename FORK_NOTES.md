@@ -168,6 +168,29 @@ mirrored file, add an entry here. (Derivable facts live in the tree; "why" only 
   working (MSVC paths, `include/strata/windows/`, `tools/windows/` are retained for that) because
   serving from WSL has latency problems — treat the Windows build as supported,
   verification-pending.
+- **Fork replay tooling** (`.fork/scripts/fork-replay.sh`, `.fork/scripts/replay-candidates.sh`,
+  `.fork/fork-candidates`, `.fork/tests/replay-fixture.sh`): turns another fork's work into reviewable
+  commits — `diff(merge-base(upstream, fork-head), fork-head)` filtered through the same
+  `.fork/path-policy`, squashed one commit per area onto a `replay/<slug>` branch. Files that refuse a
+  clean three-way apply come in with conflict markers (a pull request with conflicts, not a rejection);
+  a group that merges to this fork's current content is reported as "already present"; verification
+  asserts no non-mirror path changed and pristine files came out byte-identical to the foreign fork's
+  tree. `--pr` pushes the branch and opens an update-or-create pull request whose body is the run
+  report; the push refuses to replace a branch whose tip was not written by this tooling. Design
+  decisions worth remembering: grouping is **per path, not per commit** (a mixed commit keeps its
+  engine files and loses its Python/docs without losing work); only `mirror` paths can ever carry
+  conflict markers; the output is a review artifact — never built, never tested, never evidence that
+  anything works.
+- **History-replaced forks**: `maxfridbe/Strata_B70` shares **no commit ancestry** with upstream (its
+  628 commits are grafted/rewritten), so `fork-replay.sh` has no fork point and falls back to diffing
+  against the accepted baseline. That diff contains upstream's own post-fork changes in reverse; the
+  replay therefore never replays whole-file deletions there (168 were skipped and listed on the first
+  real run) and the report carries a prominent "⚠️ History replaced" section. A future refinement
+  could approximate the fork point by content (find the upstream commit whose tree matches theirs on
+  anchor files); until then the report's warnings are the mitigation. `lighttransport/Strata` carries
+  ~2.4M insertions of vendored trees that the path policy filters out entirely (107 unclassified paths
+  remain for a policy decision). The first real end-to-end `--pr` run opened a review-only pull
+  request from `gputier/StrataGP` (1138 foreign commits → 1 squashed commit, 2 files).
 - **Upstream sync**: engine sources are untouched, so `git diff upstream/main -- src include` stays
   meaningful; deleted add-on trees will show as ours-only removals. Local patches to mirrored
   files are listed under "Active source divergences" above.
