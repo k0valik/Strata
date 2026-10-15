@@ -53,6 +53,8 @@ rm tools/t.py
 printf 'docs changed\n' > docs/d.md
 printf 'serve changed\n' > serve/s.py
 printf 'extra data\n' > data/extra.bin
+mkdir -p tools/sim/data
+printf '{"levers": [1, 2, 3], "note": "measurement dump"}\n' > tools/sim/data/measured.json
 mkdir newdir
 printf 'newdir\n' > newdir/n.txt
 printf 'ci changed\n' > .github/w.yml
@@ -103,6 +105,7 @@ chk "our vendoring survives"  "$(git show replay/fixture:CMakeLists.txt | grep -
 chk "their change survives"   "$(git show replay/fixture:CMakeLists.txt | grep -c deadbeef)" "1"
 chk "docs stay dropped"       "$(git cat-file -e replay/fixture:docs/d.md 2>/dev/null && echo present || echo absent)" "absent"
 chk "serve stays dropped"     "$(git cat-file -e replay/fixture:serve/s.py 2>/dev/null && echo present || echo absent)" "absent"
+chk "json data excluded"      "$(git cat-file -e replay/fixture:tools/sim/data/measured.json 2>/dev/null && echo present || echo absent)" "absent"
 chk "unknown excluded"        "$(git cat-file -e replay/fixture:newdir/n.txt 2>/dev/null && echo present || echo absent)" "absent"
 chk "ours untouched (.github)" "$(git show replay/fixture:.github/w.yml)" "$(git show main:.github/w.yml)"
 chk "ours untouched (README)"  "$(git show replay/fixture:README.md)" "$(git show main:README.md)"

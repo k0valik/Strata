@@ -179,8 +179,10 @@ mirrored file, add an entry here. (Derivable facts live in the tree; "why" only 
   report; the push refuses to replace a branch whose tip was not written by this tooling. Design
   decisions worth remembering: grouping is **per path, not per commit** (a mixed commit keeps its
   engine files and loses its Python/docs without losing work); only `mirror` paths can ever carry
-  conflict markers; the output is a review artifact — never built, never tested, never evidence that
-  anything works.
+  conflict markers; the replay surface is **source-only by default** (non-source payloads — JSON
+  dumps, binaries — are skipped and listed; `--include-data` takes them; on lighttransport this
+  alone removed 34 files and 67.5k lines from the reading surface); the output is a review artifact —
+  never built, never tested, never evidence that anything works.
 - **History-replaced forks**: `maxfridbe/Strata_B70` shares **no commit ancestry** with upstream (its
   628 commits are grafted/rewritten), so `fork-replay.sh` has no fork point and falls back to diffing
   against the accepted baseline. That diff contains upstream's own post-fork changes in reverse; the
@@ -189,8 +191,8 @@ mirrored file, add an entry here. (Derivable facts live in the tree; "why" only 
   could approximate the fork point by content (find the upstream commit whose tree matches theirs on
   anchor files); until then the report's warnings are the mitigation. `lighttransport/Strata` carries
   ~2.4M insertions of vendored trees that the path policy filters out entirely (107 unclassified paths
-  remain for a policy decision). The first real end-to-end `--pr` run opened a review-only pull
-  request from `gputier/StrataGP` (1138 foreign commits → 1 squashed commit, 2 files).
+  remain for a policy decision). Review-only pull requests are open for four of the five candidates
+  (gputier, eddoursul, lighttransport, eelgaev).
 - **Upstream sync**: engine sources are untouched, so `git diff upstream/main -- src include` stays
   meaningful; deleted add-on trees will show as ours-only removals. Local patches to mirrored
   files are listed under "Active source divergences" above.

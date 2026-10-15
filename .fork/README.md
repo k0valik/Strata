@@ -112,6 +112,13 @@ they come in as three-way merges with conflict markers, exactly like a pull
 request with conflicts — resolve them, do not throw the work away.  A group
 whose merged result matches this fork's tree is reported as "already present".
 
+By default the replay surface is **source only** (this fork reads Python and
+C++): measurement dumps, binaries and other non-source payloads under mirrored
+paths are skipped and listed in the report instead of applied — the point is
+reading code, not diffing a 35-thousand-line JSON.  `--include-data` takes them
+anyway.  Every report carries a "Where the mass is" table (the top files by
+churn) so a skim starts at the rewrites, not at the data.
+
 A foreign fork whose history shares **no ancestry** with upstream (rewritten or
 grafted commits) has no fork point to diff against.  Such a replay is flagged
 **HISTORY REPLACED** in the report: the diff is their tree against the accepted

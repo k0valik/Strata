@@ -15,6 +15,11 @@
 # grouping is per path, so a commit's engine files land in their area group
 # while its Python/docs files vanish under the policy.
 #
+# The replay surface is source code by default (this fork reads Python and
+# C++): measurement dumps, binaries and other non-source payloads under
+# mirrored paths are skipped and listed instead of applied -- the point is
+# reading code, not diffing a 35k-line JSON.  --include-data takes them anyway.
+#
 # Files that refuse to apply come in as three-way merges with conflict markers
 # -- a pull request with conflicts, not a rejection.  Only mirrored paths ever
 # enter the replay; dropped/ours/protected paths never do.  A fork whose
@@ -45,6 +50,7 @@ BASELINE_OVERRIDE=''
 ALLOW_LOCAL_UPSTREAM=0
 DRY_RUN=0
 KEEP_WORKTREE=0
+INCLUDE_DATA=0
 DO_PUSH=0
 DO_PR=0
 FS_REPORT_PATH=''
@@ -80,6 +86,7 @@ usage: fork-replay.sh --fork URL --branch NAME [options]
   --allow-local-upstream  permit non-https URLs (tests only)
   --dry-run               classify and measure only; replay nothing
   --keep                  keep the replay worktree for inspection
+  --include-data          also replay non-source payloads (JSON, binaries, ...)
   --push                  push the replay branch to --remote
   --pr                    push and open/update a pull request from the report
   --pr-base NAME          base branch for the pull request (default: gh's default)
@@ -103,6 +110,7 @@ while [ $# -gt 0 ]; do
     --allow-local-upstream) ALLOW_LOCAL_UPSTREAM=1; shift ;;
     --dry-run)              DRY_RUN=1; shift ;;
     --keep)                 KEEP_WORKTREE=1; shift ;;
+    --include-data)         INCLUDE_DATA=1; shift ;;
     --push)                 DO_PUSH=1; shift ;;
     --pr)                   DO_PUSH=1; DO_PR=1; shift ;;
     --pr-base)              PR_BASE=$2; shift 2 ;;
@@ -208,8 +216,10 @@ fr_automation_owned() {
   body=$(git log -1 --format=%B "$commit" 2>/dev/null || true)
   case $body in *'Fork-Replay-Automated: true'*) ;; *) return 1 ;; esac
   case $body in *"Fork-Replay-Source: $FORK_URL"*) ;; *) return 1 ;; esac
-  # The branch must grow from this fork's line of history.
-  git merge-base --is-ancestor "$(git rev-parse "$BASE_REF")" "$commit" 2>/dev/null
+  # The branch must grow from this repository's history at all (it may be one
+  # base behind main -- that is normal for a rolling review branch); the
+  # trailers above are the real ownership proof.
+  git merge-base "$commit" "$(git rev-parse "$BASE_REF")" >/dev/null 2>&1
 }
 
 
@@ -399,8 +409,12 @@ DIVERGED_LIST=''
 DIVERGED_LIMIT=20
 DELETIONS_SKIPPED=0
 DELETIONS_SKIPPED_LIST=''
+NOT_SOURCE_COUNT=0
+NOT_SOURCE_LIST=''
+NOT_SOURCE_STAT=''
 declare -A MODE_COUNT=() MODE_LIST=() AREA_MIRROR=() AREA_SUPPRESS=() GROUP_FILES=()
 mirror_paths=()
+not_source_paths=()
 
 while IFS=$'\t' read -r status path; do
   [ -n "$path" ] || continue
@@ -423,6 +437,28 @@ while IFS=$'\t' read -r status path; do
         DELETIONS_SKIPPED_LIST="${DELETIONS_SKIPPED_LIST}  - \`${path}\`"$'\n'
       fi
       continue
+    fi
+    # Reading filter: this fork reads Python and C++; measurement dumps,
+    # binaries and other non-source payloads under mirrored paths are skipped
+    # and listed rather than applied (--include-data takes them anyway).
+    if [ "$INCLUDE_DATA" -eq 0 ]; then
+      keep=0
+      case $path in
+        CMakeLists.txt|*/CMakeLists.txt|Makefile|*/Makefile) keep=1 ;;
+        *)
+          case ${path##*.} in
+            c|cc|cpp|cxx|h|hh|hpp|cu|cuh|py|sh|cmake|in|inc|mk|S) keep=1 ;;
+          esac
+          ;;
+      esac
+      if [ "$keep" -eq 0 ]; then
+        not_source_paths+=("$path")
+        if [ "$NOT_SOURCE_COUNT" -lt 200 ]; then
+          NOT_SOURCE_LIST="${NOT_SOURCE_LIST}  - \`${path}\` (${status})"$'\n'
+        fi
+        NOT_SOURCE_COUNT=$((NOT_SOURCE_COUNT + 1))
+        continue
+      fi
     fi
     AREA_MIRROR[$area]=$(( ${AREA_MIRROR[$area]:-0} + 1 ))
     mirror_paths+=("$path")
@@ -457,6 +493,10 @@ MIRROR_STAT=''
 if [ "${#mirror_paths[@]}" -gt 0 ]; then
   MIRROR_STAT=$(git diff --no-renames --stat "$THEIR_BASE" "$FORK_HEAD" -- "${mirror_paths[@]}" | tail -1)
 fi
+if [ "${#not_source_paths[@]}" -gt 0 ]; then
+  NOT_SOURCE_STAT=$(git diff --no-renames --numstat "$THEIR_BASE" "$FORK_HEAD" -- "${not_source_paths[@]}" \
+    | awk -F'\t' '{n++; if ($1 ~ /^[0-9]+$/) a+=$1; if ($2 ~ /^[0-9]+$/) d+=$2} END {printf "%d file(s), +%d/-%d lines", n, a, d}')
+fi
 echo "fork-replay: paths       $changed_paths (mirror ${MODE_COUNT[mirror]:-0}, ours ${MODE_COUNT[ours]:-0}, dropped ${MODE_COUNT[dropped]:-0}, protected ${MODE_COUNT[protected]:-0}, unknown ${MODE_COUNT[unknown]:-0})"
 echo "fork-replay: diffstat    raw: $RAW_STAT"
 if [ -n "$MIRROR_STAT" ]; then
@@ -471,8 +511,14 @@ fi
 if [ "$DELETIONS_SKIPPED" -gt 0 ]; then
   echo "fork-replay: deletions   $DELETIONS_SKIPPED skipped (no ancestry: their deletion vs upstream's later addition is indistinguishable)"
 fi
+if [ "$NOT_SOURCE_COUNT" -gt 0 ]; then
+  echo "fork-replay: source-only $NOT_SOURCE_STAT skipped as non-source (--include-data to include)"
+fi
 
 if [ "$DRY_RUN" -eq 1 ]; then
+  if [ "$NOT_SOURCE_COUNT" -gt 0 ]; then
+    echo "fork-replay: not-source $NOT_SOURCE_STAT (skipped; --include-data to include)"
+  fi
   for g in $(printf '%s\n' "${!GROUP_FILES[@]}" | sort); do
     n=$(printf '%s' "${GROUP_FILES[$g]}" | grep -c . || true)
     echo "fork-replay: group       $g: $n file(s)"
@@ -790,6 +836,9 @@ fs_report "| filtered by policy | ${MODE_COUNT[dropped]:-0} dropped, ${MODE_COUN
 if [ "$DELETIONS_SKIPPED" -gt 0 ]; then
   fs_report "| deletions skipped | $DELETIONS_SKIPPED mirror deletion(s) not replayed (history replaced: their deletion vs upstream's later addition is indistinguishable) |"
 fi
+if [ "$NOT_SOURCE_COUNT" -gt 0 ]; then
+  fs_report "| source filter | $NOT_SOURCE_STAT skipped as non-source — the reading surface stays code (--include-data to include) |"
+fi
 fs_report "| replay branch | \`$BRANCH_OUT\` — $(git rev-list --count "$FS_BASE_REF..$REPLAY_TIP") squashed commit(s), $REPLAYED_FILES file(s) |"
 fs_report "| verification | $leaked structural leak(s); pristine files: $pristine_ok exact / $pristine_bad mismatched; both-sides-changed: $DIVERGED_COUNT; conflict-marked: ${#ALL_CONFLICTED[@]} |"
 if [ "$PUSHED" -eq 1 ]; then
@@ -948,6 +997,22 @@ for g in $(printf '%s\n' "${!GROUP_FILES[@]}" | sort); do
 done
 fs_report ''
 
+if [ -n "$REPLAY_TIP" ] && [ "$(git rev-list --count "$FS_BASE_REF..$REPLAY_TIP" 2>/dev/null || echo 0)" -gt 0 ]; then
+  fs_report '### Where the mass is (top 10 files by churn on the replay)'
+  fs_report ''
+  fs_report 'Start reading here or skip accordingly: one rewritten file explains more'
+  fs_report 'than ten thousand added lines of data.'
+  fs_report ''
+  fs_report '```'
+  git diff --numstat "$FS_BASE_REF" "$REPLAY_TIP" 2>/dev/null \
+    | awk -F'\t' '$1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ {print $1+$2 "\t" $1 "\t" $2 "\t" $3}' \
+    | sort -rn | head -10 \
+    | while IFS=$'\t' read -r t a d p; do printf '%8d  +%s/-%s  %s\n' "$t" "$a" "$d" "$p"; done \
+    | fs_report_stdin
+  fs_report '```'
+  fs_report ''
+fi
+
 if [ "$DELETIONS_SKIPPED" -gt 0 ]; then
   fs_report '### Deletions not replayed (history replaced)'
   fs_report ''
@@ -983,6 +1048,22 @@ if [ -s "$MANUAL_FILE" ]; then
   fs_report ''
   fs_report '```'
   sort -u "$MANUAL_FILE" | fs_report_stdin
+  fs_report '```'
+  fs_report ''
+fi
+
+if [ "$NOT_SOURCE_COUNT" -gt 0 ]; then
+  fs_report '### Not source (skipped; --include-data to include)'
+  fs_report ''
+  fs_report 'Measurement dumps, binaries and other non-source payloads under mirrored'
+  fs_report 'paths.  Kept out of the replay so the reading surface stays code; nothing'
+  fs_report 'is lost -- adopting one is a single checkout away.'
+  fs_report ''
+  fs_report '```'
+  printf '%s' "$NOT_SOURCE_LIST" | fs_report_stdin
+  if [ "$NOT_SOURCE_COUNT" -gt 200 ]; then
+    fs_report "  ... and $((NOT_SOURCE_COUNT - 200)) more"
+  fi
   fs_report '```'
   fs_report ''
 fi
