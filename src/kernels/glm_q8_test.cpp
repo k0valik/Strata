@@ -1,0 +1,306 @@
+// Q8_0 decode GEMVs against an FP64 reference at GLM's MLA absorb and mHC projection shapes.
+#include "strata/kernels/glm_q8.hpp"
+#include "strata/kernels/glm.hpp"
+#include "strata/kernels/native_mmvq.hpp"
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <cuda_fp16.h>
+#include <cuda_runtime.h>
+#include <iostream>
+#include <random>
+#include <stdexcept>
+#include <vector>
+namespace k = strata::kernels;
+void ck(cudaError_t e) {
+    if (e != cudaSuccess) throw std::runtime_error(cudaGetErrorString(e));
+}
+struct Q8 {
+    std::vector<uint8_t> bytes;
+    std::vector<float> values;
+};
+Q8 make(size_t count, std::mt19937 &rng) {
+    Q8 q;
+    q.bytes.resize(count / 32 * 34);
+    q.values.resize(count);
+    std::uniform_real_distribution<float> d(1e-4f, 2e-2f);
+    std::uniform_int_distribution<int> v(-127, 127);
+    for (size_t b = 0; b < count / 32; ++b) {
+        const __half h = __float2half(d(rng));
+        std::memcpy(&q.bytes[b * 34], &h, 2);
+        const float s = __half2float(h);
+        for (int i = 0; i < 32; ++i) {
+            const int8_t x = (int8_t)v(rng);
+            q.bytes[b * 34 + 2 + i] = (uint8_t)x;
+            q.values[b * 32 + i] = s * x;
+        }
+    }
+    return q;
+}
+template <class T> T *upload(const std::vector<T> &x) {
+    T *p = nullptr;
+    ck(cudaMalloc(&p, x.size() * sizeof(T)));
+    ck(cudaMemcpy(p, x.data(), x.size() * sizeof(T), cudaMemcpyHostToDevice));
+    return p;
+}
+std::vector<float> download(const float *p, size_t n) {
+    std::vector<float> x(n);
+    ck(cudaMemcpy(x.data(), p, n * 4, cudaMemcpyDeviceToHost));
+    return x;
+}
+int failures = 0;
+void check_heads_batch_bits(std::mt19937 &rng, cudaStream_t stream) {
+    const char *blocks = std::getenv("STRATA_GLM_HEADS_BLOCKS");
+    const char *batch = std::getenv("STRATA_GLM_HEADS_BLOCKS_BATCH");
+    if (!blocks || !batch || std::string(blocks) != "1" || std::string(batch) != "1") return;
+    std::uniform_real_distribution<float> values(-3.f, 3.f);
+    for (auto shape : {std::vector<int>{64,128,512},std::vector<int>{64,512,128}})
+        for (int tokens : {2,3,4,5,8}) {
+            const int heads=shape[0], in=shape[1], out=shape[2];
+            const int ix=heads*in+7, iy=heads*out+5;
+            auto weight=make((size_t)heads*in*out,rng);
+            std::vector<float> x((size_t)tokens*ix), initial((size_t)tokens*iy,1234.5f);
+            for(auto &v:x)v=values(rng);
+            auto *w=upload(weight.bytes);auto *dx=upload(x);auto *a=upload(initial);auto *b=upload(initial);
+            for(int t=0;t<tokens;++t)
+                k::glm_q8_heads_gemv(w,dx+(size_t)t*ix,a+(size_t)t*iy,heads,in,out,1,ix,iy,stream);
+            k::glm_q8_heads_gemv(w,dx,b,heads,in,out,tokens,ix,iy,stream);
+            ck(cudaStreamSynchronize(stream));
+            const auto expected=download(a,initial.size()), actual=download(b,initial.size());
+            bool same=std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float))==0;
+            for(int t=0;t<tokens;++t)for(int i=heads*out;i<iy;++i)
+                same &= actual[(size_t)t*iy+i]==1234.5f;
+            if(!same)++failures;
+            std::cout<<(same?"PASS":"FAIL")<<" heads batch bitwise/guards tokens="<<tokens<<" in="<<in<<'\n';
+            cudaFree(w);cudaFree(dx);cudaFree(a);cudaFree(b);
+        }
+}
+void compare(const char *what, const std::vector<float> &got, const std::vector<double> &want,
+             const std::vector<double> &magnitude) {
+    double worst = 0;
+    for (size_t i = 0; i < got.size(); ++i)
+        worst = std::max(worst, std::abs(got[i] - want[i]) / (magnitude[i] + 1e-30));
+    const bool pass = worst < 2e-6;
+    if (!pass) ++failures;
+    std::cout << (pass ? "PASS " : "FAIL ") << what << " worst_relative_to_abs_sum=" << worst << '\n';
+}
+void check_norm_q8(std::mt19937 &rng, cudaStream_t stream) {
+    std::uniform_real_distribution<float> values(-3.f, 3.f), weights(.5f, 1.5f);
+    int cases = 0, failed = 0;
+    for (int n : {32, 256, 4096, 16384}) for (int tokens : {1, 4}) for (int mode = 0; mode < 4; ++mode) {
+        std::vector<float> x((size_t)n * tokens), w(n);
+        for (auto &v : x) v = mode == 3 ? 0.f : values(rng);
+        for (auto &v : w) v = weights(rng) * (mode == 2 ? 1e9f : 1.f);
+        float *dx = upload(x), *dw = upload(w), *y0 = nullptr, *y1 = nullptr;
+        void *q0 = nullptr, *q1 = nullptr;
+        const size_t bytes = k::native_q8_1_bytes(n, tokens);
+        ck(cudaMalloc(&y0, x.size() * sizeof(float))); ck(cudaMalloc(&y1, x.size() * sizeof(float)));
+        ck(cudaMalloc(&q0, bytes)); ck(cudaMalloc(&q1, bytes));
+        const float *gamma = mode == 0 ? nullptr : dw;
+        k::glm_rms_norm_rows(dx, gamma, y0, n, tokens, 1e-6f, stream);
+        k::native_quantize_q8_1(y0, q0, n, tokens, stream);
+        k::glm_rms_norm_rows_q8(dx, gamma, y1, q1, n, tokens, 1e-6f, stream);
+        ck(cudaStreamSynchronize(stream));
+        const auto a = download(y0, x.size()), b = download(y1, x.size());
+        std::vector<uint8_t> qa(bytes), qb(bytes);
+        ck(cudaMemcpy(qa.data(), q0, bytes, cudaMemcpyDeviceToHost));
+        ck(cudaMemcpy(qb.data(), q1, bytes, cudaMemcpyDeviceToHost));
+        const bool same = std::memcmp(a.data(), b.data(), x.size() * sizeof(float)) == 0 && qa == qb;
+        if (!same) {
+            ++failed;
+            std::cout << "FAIL norm/Q8 bits width=" << n << " tokens=" << tokens << " mode=" << mode << '\n';
+        }
+        ++cases;
+        for (void *p : {static_cast<void *>(dx), static_cast<void *>(dw), static_cast<void *>(y0),
+                       static_cast<void *>(y1), q0, q1}) ck(cudaFree(p));
+    }
+    failures += failed;
+    std::cout << (failed ? "FAIL" : "PASS") << " fused norm/Q8 bitwise parity cases=" << cases << '\n';
+}
+int main() {
+    try {
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> act(-3.f, 3.f);
+        cudaStream_t s;
+        ck(cudaStreamCreate(&s));
+        check_norm_q8(rng, s);
+        cudaEvent_t a, b;
+        ck(cudaEventCreate(&a));
+        ck(cudaEventCreate(&b));
+        struct Shape { const char *name; int heads, in, out; };
+        for (const Shape shape : {Shape{"attn_k_b", 64, 256, 512}, Shape{"attn_v_b", 64, 512, 256}}) {
+            const size_t rows = (size_t)shape.heads * shape.out;
+            auto w = make(rows * shape.in, rng);
+            auto *dw = upload(w.bytes);
+            for (int tokens : {1, 2, 3, 4, 6, 8}) {
+                const int ld_x = shape.heads * shape.in + 32, ld_y = (int)rows + 64;
+                std::vector<float> x((size_t)tokens * ld_x);
+                for (auto &v : x) v = act(rng);
+                auto *dx = upload(x);
+                float *dy = nullptr;
+                ck(cudaMalloc(&dy, (size_t)tokens * ld_y * 4));
+                ck(cudaMemset(dy, 0, (size_t)tokens * ld_y * 4));
+                k::glm_q8_heads_gemv(dw, dx, dy, shape.heads, shape.in, shape.out, tokens, ld_x, ld_y, s);
+                ck(cudaEventRecord(a, s));
+                for (int r = 0; r < 20; ++r)
+                    k::glm_q8_heads_gemv(dw, dx, dy, shape.heads, shape.in, shape.out, tokens, ld_x, ld_y, s);
+                ck(cudaEventRecord(b, s));
+                ck(cudaEventSynchronize(b));
+                float ms = 0;
+                ck(cudaEventElapsedTime(&ms, a, b));
+                auto all = download(dy, (size_t)tokens * ld_y);
+                std::vector<float> got;
+                std::vector<double> want, magnitude;
+                for (int t = 0; t < tokens; ++t)
+                    for (size_t r = 0; r < rows; ++r) {
+                        double sum = 0, abs = 0;
+                        const size_t h = r / shape.out;
+                        for (int i = 0; i < shape.in; ++i) {
+                            const double p = (double)w.values[r * shape.in + i] * x[(size_t)t * ld_x + h * shape.in + i];
+                            sum += p; abs += std::abs(p);
+                        }
+                        got.push_back(all[(size_t)t * ld_y + r]); want.push_back(sum); magnitude.push_back(abs);
+                    }
+                std::string what = std::string(shape.name) + " tokens=" + std::to_string(tokens) +
+                                   " us=" + std::to_string(1000 * ms / 20);
+                compare(what.c_str(), got, want, magnitude);
+                cudaFree(dx); cudaFree(dy);
+            }
+            cudaFree(dw);
+        }
+        {
+            const int rows = 24, in = 16384;
+            auto w = make((size_t)rows * in, rng);
+            auto *dw = upload(w.bytes);
+            float *scratch = nullptr;
+            ck(cudaMalloc(&scratch, (size_t)rows * 8 * 32 * 4));
+            for (int tokens : {1, 2, 3, 4, 8}) {
+                std::vector<float> x((size_t)tokens * in);
+                for (auto &v : x) v = act(rng);
+                auto *dx = upload(x);
+                float *dy = nullptr;
+                ck(cudaMalloc(&dy, (size_t)tokens * rows * 4));
+                k::glm_q8_rows_gemv(dw, dx, dy, scratch, rows, in, tokens, s);
+                ck(cudaEventRecord(a, s));
+                for (int r = 0; r < 20; ++r) k::glm_q8_rows_gemv(dw, dx, dy, scratch, rows, in, tokens, s);
+                ck(cudaEventRecord(b, s));
+                ck(cudaEventSynchronize(b));
+                float ms = 0;
+                ck(cudaEventElapsedTime(&ms, a, b));
+                auto got = download(dy, (size_t)tokens * rows);
+                std::vector<double> want, magnitude;
+                for (int t = 0; t < tokens; ++t)
+                    for (int r = 0; r < rows; ++r) {
+                        double sum = 0, abs = 0;
+                        for (int i = 0; i < in; ++i) {
+                            const double p = (double)w.values[(size_t)r * in + i] * x[(size_t)t * in + i];
+                            sum += p; abs += std::abs(p);
+                        }
+                        want.push_back(sum); magnitude.push_back(abs);
+                    }
+                std::string what = "hc_fn tokens=" + std::to_string(tokens) + " us=" + std::to_string(1000 * ms / 20);
+                compare(what.c_str(), got, want, magnitude);
+                cudaFree(dx); cudaFree(dy);
+            }
+            float *dq = nullptr;
+            ck(cudaMalloc(&dq, (size_t)rows * in * 4));
+            k::glm_q8_dequant(dw, dq, (long long)rows * in, s);
+            auto values = download(dq, (size_t)rows * in);
+            const bool exact = values == w.values;
+            if (!exact) ++failures;
+            std::cout << (exact ? "PASS" : "FAIL") << " dequant exact\n";
+            cudaFree(dq); cudaFree(scratch); cudaFree(dw);
+        }
+        {
+            const int rows = 288, in = 4096;
+            std::vector<float> w((size_t)rows * in);
+            for (auto &v : w) v = act(rng) * 0.01f;
+            auto *dw = upload(w);
+            for (int tokens : {1, 2, 3, 4, 8}) {
+                std::vector<float> x((size_t)tokens * in);
+                for (auto &v : x) v = act(rng);
+                auto *dx = upload(x);
+                float *dy = nullptr;
+                ck(cudaMalloc(&dy, (size_t)tokens * rows * 4));
+                k::glm_f32_rows_gemv(dw, dx, dy, rows, in, tokens, s);
+                ck(cudaEventRecord(a, s));
+                for (int r = 0; r < 20; ++r) k::glm_f32_rows_gemv(dw, dx, dy, rows, in, tokens, s);
+                ck(cudaEventRecord(b, s));
+                ck(cudaEventSynchronize(b));
+                float ms = 0;
+                ck(cudaEventElapsedTime(&ms, a, b));
+                auto got = download(dy, (size_t)tokens * rows);
+                std::vector<double> want, magnitude;
+                for (int t = 0; t < tokens; ++t)
+                    for (int r = 0; r < rows; ++r) {
+                        double sum = 0, abs = 0;
+                        for (int i = 0; i < in; ++i) {
+                            const double p = (double)w[(size_t)r * in + i] * x[(size_t)t * in + i];
+                            sum += p; abs += std::abs(p);
+                        }
+                        want.push_back(sum); magnitude.push_back(abs);
+                    }
+                std::string what = "router_f32 tokens=" + std::to_string(tokens) + " us=" + std::to_string(1000 * ms / 20);
+                compare(what.c_str(), got, want, magnitude);
+                cudaFree(dx); cudaFree(dy);
+            }
+            cudaFree(dw);
+        }
+        {
+            // Token-batched router and mHC launches against per-token calls, bitwise.
+            const int tokens = 4, n = 4096, experts = 288, k8 = 8;
+            std::vector<float> streams((size_t)tokens * 4 * n), proj(tokens * 24), base(24), scale(3), y((size_t)tokens * n),
+                logits((size_t)tokens * experts), bias(experts);
+            for (auto *v : {&streams, &proj, &base, &scale, &y, &logits, &bias}) for (auto &x : *v) x = act(rng) * 0.3f;
+            auto *ds = upload(streams), *dp = upload(proj), *db = upload(base), *dsc = upload(scale), *dy = upload(y),
+                 *dl = upload(logits), *dbias = upload(bias);
+            float *c1, *c2, *x1, *x2, *o1, *o2, *w1, *w2;
+            int *i1, *i2;
+            for (float **p : {&c1, &c2}) ck(cudaMalloc(p, tokens * 24 * 4));
+            for (float **p : {&x1, &x2}) ck(cudaMalloc(p, (size_t)tokens * n * 4));
+            for (float **p : {&o1, &o2}) ck(cudaMalloc(p, (size_t)tokens * 4 * n * 4));
+            for (float **p : {&w1, &w2}) ck(cudaMalloc(p, tokens * k8 * 4));
+            for (int **p : {&i1, &i2}) ck(cudaMalloc(p, tokens * k8 * 4));
+            for (int t = 0; t < tokens; ++t) {
+                k::glm_mhc_read(ds + (size_t)t * 4 * n, dp + t * 24, db, dsc, c1 + t * 24, x1 + (size_t)t * n, n, 20, 1e-6f, s);
+                k::glm_mhc_write(ds + (size_t)t * 4 * n, c1 + t * 24, dy + (size_t)t * n, o1 + (size_t)t * 4 * n, n, s);
+                k::glm_router(dl + t * experts, dbias, i1 + t * k8, w1 + t * k8, experts, k8, 2.5f, s);
+            }
+            k::glm_mhc_read_tokens(ds, dp, db, dsc, c2, x2, n, 20, 1e-6f, tokens, s);
+            k::glm_mhc_write_tokens(ds, c2, dy, o2, n, tokens, s);
+            k::glm_router_tokens(dl, dbias, i2, w2, experts, k8, 2.5f, tokens, s);
+            ck(cudaStreamSynchronize(s));
+            auto same = [&](const void *a, const void *b2, size_t bytes) {
+                std::vector<char> ha(bytes), hb(bytes);
+                ck(cudaMemcpy(ha.data(), a, bytes, cudaMemcpyDeviceToHost));
+                ck(cudaMemcpy(hb.data(), b2, bytes, cudaMemcpyDeviceToHost));
+                return ha == hb;
+            };
+            const bool ok = same(c1, c2, tokens * 24 * 4) && same(x1, x2, (size_t)tokens * n * 4) &&
+                            same(o1, o2, (size_t)tokens * 4 * n * 4) && same(i1, i2, tokens * k8 * 4) && same(w1, w2, tokens * k8 * 4);
+            if (!ok) ++failures;
+            std::cout << (ok ? "PASS" : "FAIL") << " token-batched router/mHC bitwise equal to per-token calls\n";
+            // Fused deferral save must preserve the output and every coefficient,
+            // including with streams updated in place and across several tokens.
+            float *saved;
+            ck(cudaMalloc(&saved, tokens * 24 * 4));
+            k::glm_mhc_write_tokens_save(ds, c2, dy, o2, saved, n, tokens, s);
+            ck(cudaStreamSynchronize(s));
+            bool save_ok = same(o1, o2, (size_t)tokens * 4 * n * 4) && same(c2, saved, tokens * 24 * 4);
+            ck(cudaMemcpyAsync(o2, ds, (size_t)tokens * 4 * n * 4, cudaMemcpyDeviceToDevice, s));
+            k::glm_mhc_write_tokens_save(o2, c2, dy, o2, saved, n, tokens, s);
+            ck(cudaStreamSynchronize(s));
+            save_ok &= same(o1, o2, (size_t)tokens * 4 * n * 4) && same(c2, saved, tokens * 24 * 4);
+            if (!save_ok) ++failures;
+            std::cout << (save_ok ? "PASS" : "FAIL") << " fused mHC write/save bitwise output and coefficients\n";
+            cudaFree(saved);
+        }
+        check_heads_batch_bits(rng,s);
+        std::cout << (failures ? "FAIL" : "PASS") << " glm_q8_test\n";
+        return failures != 0;
+    } catch (const std::exception &e) {
+        std::cerr << "glm_q8_test: " << e.what() << '\n';
+        return 1;
+    }
+}

@@ -20,6 +20,8 @@
 //
 // This file is compiled for AVX2 and must not run anything before the engine's cpu_avx2_ok() check: no runtime
 // initializer at namespace scope (#391, 016ea2e), the switches are read on first use.
+#include <string>
+#include <stdexcept>
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 
@@ -462,18 +464,40 @@ int iq256_variant() noexcept {
 
 int iq256_variants() noexcept { return kIq256Gather | (vnni_on() ? kIq256Vnni : 0); }
 
-void iq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
-                     const void* const* act, int nt, float* const* ff, int r0, int r1) {
+namespace {
+// The gate/up rows in a variant, with GLM's SwiGLU clamp (limit > 0) and separate up rows; limit 0 and no
+// separate_up are iq256_gu_rows_v's bits.
+void gu_rows_variant(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                     const void* const* act, int nt, float* const* ff, int r0, int r1, float limit,
+                     const uint8_t* separate_up) {
     const bool g = (variant & kIq256Gather) != 0;
 #if STRATA_AVXVNNI
     if (variant & kIq256Vnni) {
-        if (g) vnni::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
-        else vnni::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+        if (g) vnni::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit, separate_up);
+        else vnni::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit, separate_up);
         return;
     }
 #endif
-    if (g) plain::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
-    else plain::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1);
+    if (g) plain::gu_type<true>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit, separate_up);
+    else plain::gu_type<false>(type, nt, blob, gu_row, up_off, n, act, ff, r0, r1, limit, separate_up);
+}
+}  // namespace
+
+void iq256_gu_rows_v(int variant, int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
+                     const void* const* act, int nt, float* const* ff, int r0, int r1) {
+    gu_rows_variant(variant, type, blob, gu_row, up_off, n, act, nt, ff, r0, r1, 0.f, nullptr);
+}
+
+void iq256_gu_rows_clamped(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
+                           int nt, float* const* ff, int r0, int r1, float limit, const uint8_t* separate_up) {
+    gu_rows_variant(iq256_variant(), type, blob, gu_row, up_off, n, act, nt, ff, r0, r1, limit, separate_up);
+}
+
+// The GLM branch's lossless direct-magnitude IQ2_S/IQ3_S planes are not part of this kernel set (upstream's 121/122
+// are its gathered decodes of the original bytes): no format is prepared, so CPU prepacking keeps the original rows.
+size_t iq256_prepared_row_bytes(int, int) { return 0; }
+void iq256_prepare_rows(int type, const uint8_t*, uint8_t*, int, int) {
+    throw std::invalid_argument("iq256_prepare_rows: no prepared layout for type " + std::to_string(type));
 }
 
 void iq256_rows_v(int variant, int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt,
